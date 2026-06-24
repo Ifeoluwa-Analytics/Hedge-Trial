@@ -1,284 +1,223 @@
-"""
-CLOUD API SERVER MODULE
-=======================
-Runs on Render.com to handle WebSocket connections, database logging,
-and real-time status broadcasting to the frontend (index.html).
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hedge Guardian View</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
 
-This module receives RSSI data from local_ble_scanner.py and:
-1. Logs telemetry to SQLite database
-2. Replays the last known database record to newly connected web clients
-3. Broadcasts status updates via WebSocket to connected clients
-4. Serves the frontend HTML dashboard
-"""
+<body class="bg-gray-900 text-white font-sans antialiased transition-colors duration-500" id="body-bg">
 
-import os
-import asyncio
-from contextlib import asynccontextmanager
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+    <div class="max-w-md mx-auto min-h-screen flex flex-col justify-between p-6">
 
-# Database imports
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+        <header class="text-center py-4">
+            <h1 class="text-2xl font-black tracking-wider text-emerald-400">HEDGE</h1>
+            <p class="text-gray-400 text-xs">Micro-Location Proximity Tracker</p>
+        </header>
 
-# --- DATABASE CONFIGURATION ---
-import os
+        <main class="flex-1 flex flex-col justify-center items-center my-6">
+            <div id="status-card"
+                 class="w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500">
 
-# --- DATABASE CONFIGURATION ---
-# ◄ FIX: Force an absolute environment path so Render can always read/write the DB securely
-DATABASE_URL = "sqlite:////tmp/hedge_tracker.db" 
+                <div class="flex justify-center mb-6">
+                    <div id="status-pulse"
+                         class="w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse">
+                        <div id="status-dot"
+                             class="w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl">
+                            📡
+                        </div>
+                    </div>
+                </div>
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+                <h2 id="child-name"  class="text-xl font-bold mb-1">Waiting for Beacon...</h2>
+                <h3 id="child-id"    class="text-sm text-gray-500 mb-1">CH_--</h3>
+                <p  id="system-message" class="text-gray-400 text-sm mb-6">
+                    Start your scanner loop to transmit signal details.
+                </p>
 
-# --- DATABASE MODELS ---
-class Guardian(Base):
-    __tablename__ = "guardians"
-    guardian_id = Column(String, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    phone_number = Column(String, nullable=False)
-    session_token = Column(String, nullable=True)
+                <hr class="border-gray-700 my-4">
 
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="bg-gray-900 p-3 rounded-xl border border-gray-700/50">
+                        <p class="text-xs text-gray-400 uppercase tracking-wider">Signal (RSSI)</p>
+                        <p id="rssi-val" class="text-lg font-bold text-gray-200">-- dBm</p>
+                    </div>
+                    <div class="bg-gray-900 p-3 rounded-xl border border-gray-700/50">
+                        <p class="text-xs text-gray-400 uppercase tracking-wider">Status</p>
+                        <p id="status-val" class="text-lg font-bold text-emerald-400">STANDBY</p>
+                    </div>
+                </div>
+            </div>
+        </main>
 
-class Child(Base):
-    __tablename__ = "children"
-    child_id = Column(String, primary_key=True, index=True)
-    guardian_id = Column(String, ForeignKey("guardians.guardian_id"), nullable=False)
-    name = Column(String, nullable=False)
+        <footer id="emergency-action" class="w-full hidden pb-4">
+            <button
+                onclick="escalate()"
+                class="w-full bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold
+                       py-4 px-6 rounded-2xl shadow-lg uppercase tracking-wide text-sm
+                       transition-all animate-bounce">
+                Escalate to Venue Security
+            </button>
+        </footer>
 
+    </div><!-- /max-w -->
 
-class BeaconTelemetry(Base):
-    __tablename__ = "beacons"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    beacon_mac = Column(String, nullable=False)
-    child_id = Column(String, ForeignKey("children.child_id"), nullable=False)
-    rssi_threshold = Column(Integer, nullable=False)
-    current_rssi = Column(Integer, nullable=False)
-    current_status = Column(String, nullable=False)
+    <audio id="alarm-sound"
+           src="https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg"
+           preload="auto"
+           loop></audio>
 
+    <script>
+    // ─── DOM REFS ─────────────────────────────────────────────────────────────
+    const bodyBg          = document.getElementById('body-bg');
+    const statusCard      = document.getElementById('status-card');
+    const statusDot       = document.getElementById('status-dot');
+    const statusPulse     = document.getElementById('status-pulse');
+    const childName       = document.getElementById('child-name');
+    const childId         = document.getElementById('child-id');
+    const systemMessage   = document.getElementById('system-message');
+    const rssiVal         = document.getElementById('rssi-val');
+    const statusVal       = document.getElementById('status-val');
+    const emergencyAction = document.getElementById('emergency-action');
+    const alarmSound      = document.getElementById('alarm-sound');
 
-# --- CONFIGURATION ---
-MOCK_GUARDIAN_ID = "g-uuid-1111-2222"
-MOCK_BEACON_MAC = "00:1a:7d:da:71:11"
-CHILD_ID = "CH_01"
-CHILD_NAME = "Ifeoluwa Olaloye"
+    // ─── AUDIO UNLOCK ────────────────────────────────────────────────────────
+    // Mobile browsers (Safari, Chrome-Android) require a user gesture before
+    // audio can play. We silently attempt to play/pause on the first tap
+    // anywhere on the page to pre-unlock the audio context.
+    let audioUnlocked = false;
 
-STRONG_THRESHOLD = -70
-WEAK_THRESHOLD = -100
-
-
-# --- DATABASE FUNCTIONS ---
-def initialize_and_seed_database():
-    """Creates database tables and seeds mock data"""
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    try:
-        if not db.query(Guardian).filter(Guardian.guardian_id == MOCK_GUARDIAN_ID).first():
-            mock_guardian = Guardian(
-                guardian_id=MOCK_GUARDIAN_ID,
-                name="Aduojo Ilemona",
-                phone_number="+2348000000000",
-                session_token="session_active_abc123",
-            )
-            db.add(mock_guardian)
-            db.commit()
-
-        if not db.query(Child).filter(Child.child_id == CHILD_ID).first():
-            mock_child = Child(
-                child_id=CHILD_ID,
-                guardian_id=MOCK_GUARDIAN_ID,
-                name=CHILD_NAME,
-            )
-            db.add(mock_child)
-            db.commit()
-        print("💾 Database initialized and verified successfully.")
-    except Exception as e:
-        print(f"Seed warning: {e}")
-    finally:
-        db.close()
-
-
-def log_telemetry_to_db(child_id: str, rssi: int, status: str, threshold: int):
-    """Logs telemetry reading to database"""
-    db = SessionLocal()
-    try:
-        log_entry = BeaconTelemetry(
-            timestamp=datetime.now(),
-            beacon_mac=MOCK_BEACON_MAC,
-            child_id=child_id,
-            rssi_threshold=threshold,
-            current_rssi=rssi,
-            current_status=status,
-        )
-        db.add(log_entry)
-        db.commit()
-    except Exception as e:
-        print(f"Database write error: {e}")
-    finally:
-        db.close()
-
-
-# --- WEBSOCKET CONNECTION MANAGER ---
-class ConnectionManager:
-    """Manages WebSocket connections for real-time broadcasting"""
-
-    def __init__(self):
-        self.active_connections = []
-
-    async def connect(self, websocket: WebSocket):
-        """Accept new WebSocket connection"""
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        """Remove disconnected WebSocket"""
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-
-    async def broadcast(self, message: dict):
-        """Broadcast message to all connected clients"""
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except:
-                pass
-
-
-manager = ConnectionManager()
-
-
-# --- API MODELS ---
-class BeaconPayload(BaseModel):
-    """Payload from local BLE scanner"""
-    child_id: str
-    child_name: str
-    rssi: int
-    status: str  
-    message: str  
-
-
-# --- MODERN LIFESPAN LIFECYCLE MANAGEMENT ---
-# ◄ FIXED: Switched from deprecated on_event to modern lifespan context manager
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Guarantees table creation and configuration execution prior to processing requests"""
-    initialize_and_seed_database()
-    print("✅ Cloud API Server started successfully via Lifespan Engine!")
-    print("📱 Waiting for telemetry from local BLE scanner...")
-    yield
-    # Clean up operations go here on shutdown if needed
-
-
-# --- FastAPI App Setup ---
-app = FastAPI(title="Hedge Cloud API", version="1.0", lifespan=lifespan)
-
-# Enable CORS for cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --- FRONTEND ROUTES ---
-@app.get("/")
-def serve_frontend():
-    """Serve the dashboard HTML"""
-    return FileResponse("index.html")
-
-
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    return {"status": "Hedge Cloud API is Running"}
-
-
-# --- TELEMETRY ENDPOINT ---
-@app.post("/api/telemetry")
-async def receive_telemetry(payload: BeaconPayload):
-    """
-    Receives processed telemetry from local BLE scanner and broadcasts downstream.
-    """
-    status = payload.status 
-
-    # Log telemetry entry straight to SQLite
-    log_telemetry_to_db(payload.child_id, payload.rssi, status, STRONG_THRESHOLD)
-
-    # Forward data packet downstream to the browser dashboard
-    broadcast_payload = {
-        "child_id": payload.child_id,
-        "child_name": payload.child_name,
-        "rssi": payload.rssi,
-        "status": status,
-        "message": payload.message, 
+    function tryUnlockAudio() {
+        if (audioUnlocked) return;
+        alarmSound.play()
+            .then(() => { alarmSound.pause(); alarmSound.currentTime = 0; audioUnlocked = true; })
+            .catch(() => { /* silent — browser blocked; will retry on next gesture */ });
     }
-    await manager.broadcast(broadcast_payload)
+    document.addEventListener('click',      tryUnlockAudio, { passive: true });
+    document.addEventListener('touchstart', tryUnlockAudio, { passive: true });
 
-    print(f"📊 Telemetry logged: {payload.child_name} | RSSI: {payload.rssi} dBm | Status: {status}")
-    return {"status": "Processed", "child_status": status}
+    // ─── ESCALATION HANDLER ──────────────────────────────────────────────────
+    function escalate() {
+        alert('🚨 Venue Security has been notified. Help is on the way.');
+        // In production: POST to /api/escalate or send SMS via backend.
+    }
 
+    // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
+    // Maps every status the server can send to a visual theme.
+    // FIX: "NOT_FOUND" was missing from the yellow/warning branch in the
+    //      original code, so the UI silently did nothing on that state.
 
-# --- WEBSOCKET ENDPOINT (WITH HISTORICAL BACKFILL) ---
-# --- WEBSOCKET ENDPOINT (WITH HISTORICAL BACKFILL) ---
-@app.websocket("/ws/monitor")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for frontend real-time dashboard updates.
-    """
-    await manager.connect(websocket)
-    
-    db: Session = SessionLocal()
-    try:
-        last_log = (
-            db.query(BeaconTelemetry)
-            .filter(BeaconTelemetry.child_id == CHILD_ID)
-            .order_by(BeaconTelemetry.id.desc())
-            .first()
-        )
-        
-        if last_log:
-            await websocket.send_json({
-                "child_id": last_log.child_id,
-                "child_name": CHILD_NAME,
-                "rssi": last_log.current_rssi,
-                "status": last_log.current_status,
-                "message": f"Last seen at {last_log.timestamp.strftime('%H:%M:%S')} (Restored from log)"
-            })
-        else:
-            await websocket.send_json({
-                "child_id": CHILD_ID,
-                "child_name": CHILD_NAME,
-                "rssi": 0,
-                "status": "INIT",
-                "message": "System connected, waiting for telemetry scanner...",
-            })
-    except Exception as e:
-        print(f"⚠️ Error fetching initial database state: {e}")
-    finally:
-        db.close()
+    function applyTheme(status) {
+        // Reset shared elements first
+        emergencyAction.classList.add('hidden');
+        alarmSound.pause();
 
-    # ◄ FIXED: Robust asynchronous handling loop for Render deployment nodes
-    try:
-        while True:
-            # Using a short timeout ensures the worker thread doesn't hang or close arbitrarily
-            try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-            except asyncio.TimeoutError:
-                # Send a faint heartbeat pulse to the browser to ensure Render proxy keeps channel alive
-                await websocket.send_json({"status": "HEARTBEAT", "message": "Keep-Alive Ping"})
-                continue
+        switch (status) {
 
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        print("🔌 WebSocket client disconnected clean.")
-    except Exception as e:
-        manager.disconnect(websocket)
-        print(f"⚠️ WebSocket connection dropped implicitly by host runtime: {e}")
+            case 'SECURE':
+                bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
+                statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
+                statusDot.className   = 'w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl';
+                statusPulse.className = 'w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse';
+                statusVal.className   = 'text-lg font-bold text-emerald-400';
+                statusDot.textContent = '📡';
+                break;
+
+            // ── FIX: backend sends "NOT_FOUND" for weak/searching state ──────
+            case 'NOT_FOUND':
+            case 'WEAK':
+                bodyBg.className      = 'bg-yellow-950 text-white font-sans antialiased transition-colors duration-500';
+                statusCard.className  = 'w-full bg-yellow-900/80 rounded-3xl p-8 text-center shadow-2xl border border-yellow-500 transition-all duration-500';
+                statusDot.className   = 'w-12 h-12 rounded-full bg-yellow-500 flex items-center justify-center text-2xl animate-bounce';
+                statusPulse.className = 'w-24 h-24 rounded-full bg-yellow-600/40 flex items-center justify-center';
+                statusVal.className   = 'text-lg font-bold text-yellow-200';
+                statusDot.textContent = '⚠️';
+                emergencyAction.classList.remove('hidden');
+                break;
+
+            case 'BREACH':
+            case 'LOST':
+                bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
+                statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
+                statusDot.className   = 'w-12 h-12 rounded-full bg-red-500 flex items-center justify-center text-2xl';
+                statusPulse.className = 'w-24 h-24 rounded-full bg-red-600/40 flex items-center justify-center animate-ping';
+                statusVal.className   = 'text-lg font-bold text-red-200';
+                statusDot.textContent = '🚨';
+                emergencyAction.classList.remove('hidden');
+                if (audioUnlocked) alarmSound.play().catch(() => {});
+                break;
+
+            case 'INIT':
+            default:
+                bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
+                statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
+                statusDot.className   = 'w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center text-2xl animate-pulse';
+                statusPulse.className = 'w-24 h-24 rounded-full bg-blue-500/20 flex items-center justify-center';
+                statusVal.className   = 'text-lg font-bold text-blue-400';
+                statusDot.textContent = '🔍';
+                break;
+        }
+    }
+
+    // ─── WEBSOCKET ────────────────────────────────────────────────────────────
+    let socket;
+    let reconnectDelay = 4000;   // ms — slightly longer than original to reduce spam
+    let reconnectTimer = null;
+
+    function connect() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl    = `${protocol}//${window.location.host}/ws/monitor`;
+        console.log(`🔌 [HEDGE] Connecting → ${wsUrl}`);
+
+        systemMessage.textContent = 'Connecting to cloud engine…';
+
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+            console.log('✅ [HEDGE] WebSocket open');
+            reconnectDelay = 4000;           // reset back-off on successful connect
+            systemMessage.textContent = 'Scanning for beacon signals…';
+        };
+
+        socket.onmessage = (event) => {
+            let data;
+            try { data = JSON.parse(event.data); }
+            catch { return; }
+
+            console.log('📥 [HEDGE] Packet:', data);
+
+            // ── FIX: guard HEARTBEAT BEFORE touching DOM ──────────────────
+            if (data.status === 'HEARTBEAT') return;
+
+            // Update text content
+            childName.textContent     = data.child_name || 'Unknown';
+            childId.textContent       = data.child_id   || 'CH_--';
+            rssiVal.textContent       = (data.rssi !== undefined ? data.rssi : '--') + ' dBm';
+            systemMessage.textContent = data.message    || '';
+            statusVal.textContent     = data.status     || 'UNKNOWN';
+
+            // Apply matching visual theme
+            applyTheme(data.status);
+        };
+
+        socket.onclose = (e) => {
+            console.warn(`❌ [HEDGE] Connection closed (code ${e.code}) — retrying in ${reconnectDelay / 1000}s`);
+            systemMessage.textContent = `Reconnecting… (${reconnectDelay / 1000}s)`;
+            // Exponential back-off, capped at 30 s
+            reconnectTimer = setTimeout(() => {
+                reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+                connect();
+            }, reconnectDelay);
+        };
+
+        socket.onerror = (e) => {
+            console.error('⚠️  [HEDGE] WebSocket error', e);
+            // onclose fires after onerror — reconnect logic lives there
+        };
+    }
+
+    connect();
+    </script>
+</body>
+</html>
