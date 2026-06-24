@@ -32,7 +32,7 @@ SCAN_INTERVAL = 1.0  # seconds
 
 # --- CLOUD API CONFIGURATION ---
 # Point to your Render.com deployment
-CLOUD_API_BASE_URL = "https://hedge-2.onrender.com"  # UPDATE THIS
+CLOUD_API_BASE_URL = "https://hedge-trial.onrender.com"  # UPDATE THIS
 API_TELEMETRY_ENDPOINT = f"{CLOUD_API_BASE_URL}/api/telemetry"
 
 
