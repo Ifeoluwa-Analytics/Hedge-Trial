@@ -12,9 +12,10 @@ from sqlalchemy import create_engine, Column, String, Integer, DateTime, Foreign
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# ─── DATABASE CONFIGURATION ───────────────────────────────────────────────────
-# /tmp is writable on Render's ephemeral filesystem.
-DATABASE_URL = "sqlite:////tmp/hedge_tracker.db"
+
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+DATABASE_PATH = os.path.join(BASE_DIR, "hedge_tracker.db")
+DATABASE_URL  = f"sqlite:///{DATABASE_PATH}"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -84,6 +85,7 @@ def initialize_and_seed_database():
             db.commit()
 
         print("💾 Database initialised and seeded successfully.")
+        print(f"💾 DB file location → {DATABASE_PATH}")
     except Exception as exc:
         db.rollback()
         print(f"⚠️  Seed warning: {exc}")
@@ -202,7 +204,9 @@ app.add_middleware(
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def serve_frontend():
-    return FileResponse("index.html")
+    # FIX: resolve index.html relative to this script too, so "python
+    # cloud_api_server.py" works regardless of your current terminal folder.
+    return FileResponse(os.path.join(BASE_DIR, "index.html"))
 
 
 @app.get("/health")
@@ -290,3 +294,8 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as exc:
         manager.disconnect(websocket)
         print(f"⚠️  WebSocket dropped: {exc}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("cloud_api_server:app", host="0.0.0.0", port=8000, reload=False)
