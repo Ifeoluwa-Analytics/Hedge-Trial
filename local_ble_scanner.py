@@ -19,8 +19,8 @@ RSSI_BUFFER_SIZE           = 5     # sliding-window size
 MIN_CONSECUTIVE_FOR_BREACH = 5     # missed cycles before BREACH
 SCAN_INTERVAL              = 1.0   # seconds between telemetry posts
 
-# ─── CLOUD API ───────────────────────────────────────────────────────────────
-CLOUD_API_BASE_URL   = "https://hedge-trial.onrender.com"   # ← update if URL changes
+
+CLOUD_API_BASE_URL     = "http://localhost:8000"
 API_TELEMETRY_ENDPOINT = f"{CLOUD_API_BASE_URL}/api/telemetry"
 API_HEALTH_ENDPOINT    = f"{CLOUD_API_BASE_URL}/health"
 
@@ -123,7 +123,7 @@ class LocalBLEScanner:
                 print(f"❌ Cloud HTTP {r.status_code}: {r.text[:120]}")
                 return False
         except requests.exceptions.ConnectionError:
-            print(f"❌ Cannot reach {CLOUD_API_BASE_URL} — is the Render service awake?")
+            print(f"❌ Cannot reach {CLOUD_API_BASE_URL} — is cloud_api_server.py running?")
             return False
         except Exception as exc:
             print(f"❌ POST error: {exc}")
@@ -135,18 +135,18 @@ class LocalBLEScanner:
 
     # ── Connectivity pre-check ────────────────────────────────────────────────
     async def check_cloud_connectivity(self):
-        print(f"🌐 Checking Render connectivity → {API_HEALTH_ENDPOINT}")
+        print(f"🌐 Checking server connectivity → {API_HEALTH_ENDPOINT}")
         try:
             r = await asyncio.to_thread(
                 lambda: requests.get(API_HEALTH_ENDPOINT, timeout=10)
             )
             if r.status_code == 200:
-                print(f"✅ Render reachable: {r.json()}")
+                print(f"✅ Server reachable: {r.json()}")
             else:
-                print(f"⚠️  Render responded with HTTP {r.status_code}")
+                print(f"⚠️  Server responded with HTTP {r.status_code}")
         except Exception as exc:
-            print(f"⚠️  Render health check failed: {exc}")
-            print("    The scanner will still run — posts may fail until Render wakes up.")
+            print(f"⚠️  Health check failed: {exc}")
+            print("    Make sure cloud_api_server.py is running first (python cloud_api_server.py).")
 
     # ── Main scan loop ────────────────────────────────────────────────────────
     async def start_scanning(self):
