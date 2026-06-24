@@ -1,184 +1,182 @@
-"""
-LOCAL BLE SCANNER MODULE
-========================
-Runs on local machine to handle Bluetooth Low Energy scanning.
-Sends RSSI readings to cloud API server running on Render.com
-
-This module is lightweight and only requires:
-- bleak (BLE library)
-- requests (HTTP client)
-"""
-
 import asyncio
 import requests
 from bleak import BleakScanner
 from collections import deque
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Dict
 
-# --- CONFIGURATION ---
-TARGET_NAME = "Melody's A07"
-CHILD_ID = "CH_01"
-CHILD_NAME = "Ifeoluwa Olaloye"
+# ─── CONFIGURATION ───────────────────────────────────────────────────────────
+TARGET_NAME = "Melody's A07"       # BLE advertisement name to track
+CHILD_ID    = "CH_01"
+CHILD_NAME  = "Ifeoluwa Olaloye"
 
-# THRESHOLDS
-STRONG_THRESHOLD = -70
-WEAK_THRESHOLD = -100
+# RSSI thresholds (dBm)
+STRONG_THRESHOLD = -70             # ≥ this  →  SECURE
+WEAK_THRESHOLD   = -100            # ≥ this  →  WEAK  (else BREACH if detected)
 
-# Polling configuration
-RSSI_BUFFER_SIZE = 5
-MIN_CONSECUTIVE_FOR_BREACH = 5
-SCAN_INTERVAL = 1.0  # seconds
+# Polling / smoothing
+RSSI_BUFFER_SIZE           = 5     # sliding-window size
+MIN_CONSECUTIVE_FOR_BREACH = 5     # missed cycles before BREACH
+SCAN_INTERVAL              = 1.0   # seconds between telemetry posts
 
-# --- CLOUD API CONFIGURATION ---
-# Point to your Render.com deployment
-CLOUD_API_BASE_URL = "https://hedge-trial.onrender.com"  # UPDATE THIS
+# ─── CLOUD API ───────────────────────────────────────────────────────────────
+CLOUD_API_BASE_URL   = "https://hedge-trial.onrender.com"   # ← update if URL changes
 API_TELEMETRY_ENDPOINT = f"{CLOUD_API_BASE_URL}/api/telemetry"
+API_HEALTH_ENDPOINT    = f"{CLOUD_API_BASE_URL}/health"
 
 
+# ─── SCANNER CLASS ───────────────────────────────────────────────────────────
 class LocalBLEScanner:
-    """
-    Handles BLE scanning on the local machine.
-    Processes RSSI data and sends it to cloud API.
-    """
-
     def __init__(self):
-        self.rssi_buffer = deque(maxlen=RSSI_BUFFER_SIZE)
-        self.consecutive_not_found = 0
-        self.last_status = "INIT"
-        self.last_seen_time = datetime.now()
-        self.running = False
+        self.rssi_buffer            = deque(maxlen=RSSI_BUFFER_SIZE)
+        self.consecutive_not_found  = 0
+        self.last_status            = "INIT"
+        self.last_seen_time         = datetime.now()
+        self.running                = False
 
+    # ── BLE callback ─────────────────────────────────────────────────────────
     async def detection_callback(self, device, adv_data):
-        """Called when a BLE device is detected"""
         name = adv_data.local_name or device.name
-
         if name and TARGET_NAME.lower() in name.lower():
             self.consecutive_not_found = 0
-            self.last_seen_time = datetime.now()
+            self.last_seen_time        = datetime.now()
             self.rssi_buffer.append(adv_data.rssi)
             print(f"📡 Beacon detected: {name} | RSSI: {adv_data.rssi} dBm")
 
-    async def calculate_rssi_status(self) -> Dict[str, any]:
+    # ── Status calculation ────────────────────────────────────────────────────
+    async def calculate_status(self) -> Dict:
         """
-        Calculates current RSSI status and returns payload for cloud API.
-        
-        Returns:
-            dict: Payload containing child_id, child_name, rssi, status, message
-        """
-        time_since_last_seen = (datetime.now() - self.last_seen_time).total_seconds()
+        Builds the telemetry payload.
 
-        if time_since_last_seen > 2.5:
+        Status contract
+        ───────────────
+        SECURE      beacon visible AND RSSI ≥ STRONG_THRESHOLD
+        WEAK        beacon visible AND STRONG > RSSI ≥ WEAK_THRESHOLD
+        NOT_FOUND   beacon timed out, consecutive misses < MIN_CONSECUTIVE
+        BREACH      beacon timed out, consecutive misses ≥ MIN_CONSECUTIVE
+        """
+        elapsed = (datetime.now() - self.last_seen_time).total_seconds()
+
+        # Age out the buffer slowly when beacon is missing
+        if elapsed > 2.5:
             self.consecutive_not_found += 1
-
-        # Calculate average RSSI
-        if self.rssi_buffer:
-            avg_rssi = round(sum(self.rssi_buffer) / len(self.rssi_buffer))
-            if time_since_last_seen > 1.5:
+            if self.rssi_buffer:
                 self.rssi_buffer.popleft()
-        else:
-            avg_rssi = -120
 
-        # Determine security status
-        if time_since_last_seen <= 2.5:
+        avg_rssi = (
+            round(sum(self.rssi_buffer) / len(self.rssi_buffer))
+            if self.rssi_buffer
+            else -120
+        )
+
+        # ── FIX: clear status vocabulary ─────────────────────────────────────
+        if elapsed <= 2.5:
+            # Beacon was seen recently
             if avg_rssi >= STRONG_THRESHOLD:
-                new_status = "SECURE"
-                msg = "Phone inside safe perimeter"
+                status = "SECURE"
+                msg    = "Phone inside safe perimeter"
             elif avg_rssi >= WEAK_THRESHOLD:
-                new_status = "NOT_FOUND"
-                msg = "Signal weak - Move closer"
+                status = "WEAK"                         # ← was "NOT_FOUND" — fixed
+                msg    = "Signal weak — move closer"
             else:
-                new_status = "BREACH"
-                msg = "Phone out of bounds!"
+                status = "BREACH"
+                msg    = "Signal critically low!"
         else:
+            # Beacon has not been seen for > 2.5 s
             if self.consecutive_not_found >= MIN_CONSECUTIVE_FOR_BREACH:
-                new_status = "BREACH"
-                msg = "Beacon NOT DETECTED"
+                status   = "BREACH"
+                msg      = "Beacon NOT DETECTED"
                 avg_rssi = -120
             else:
-                new_status = self.last_status
-                msg = "Searching..."
+                status = "NOT_FOUND"                    # searching, not yet BREACH
+                msg    = "Searching for beacon…"
 
-        self.last_status = new_status  
+        self.last_status = status
 
-        # Pack the full state context variables before sending to Render
-        payload = {
-            "child_id": CHILD_ID,
-            "child_name": CHILD_NAME,
-            "rssi": avg_rssi,
-            "status": new_status,  # ◄ Add this
-            "message": msg         # ◄ Add this
-        }
-
-        # Log locally
-        if time_since_last_seen <= 2.5:
-            print(f"📱 {CHILD_NAME} | RSSI: {avg_rssi} dBm | {new_status}")
+        # Console feedback
+        if elapsed <= 2.5:
+            print(f"📱 {CHILD_NAME} | RSSI: {avg_rssi} dBm | {status}")
         else:
             print(
-                f"🚫 {CHILD_NAME} | NOT FOUND | {new_status} (missed cycles: {self.consecutive_not_found})"
+                f"🚫 {CHILD_NAME} | NOT SEEN | {status} "
+                f"(missed cycles: {self.consecutive_not_found})"
             )
 
-        return payload
+        return {
+            "child_id":   CHILD_ID,
+            "child_name": CHILD_NAME,
+            "rssi":       avg_rssi,
+            "status":     status,
+            "message":    msg,
+        }
 
-    async def send_to_cloud(self, payload: Dict) -> bool:
-        """
-        Sends RSSI payload to cloud API server.
-        
-        Args:
-            payload: Dictionary with child_id, child_name, rssi
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    # ── HTTP POST (thread-pool safe) ──────────────────────────────────────────
+    def _post_sync(self, payload: Dict) -> bool:
+        """Synchronous POST — called via asyncio.to_thread to avoid blocking."""
         try:
-            response = requests.post(
-                API_TELEMETRY_ENDPOINT, json=payload, timeout=5
-            )
-            if response.status_code == 200:
-                result = response.json()
-                status = result.get("child_status", "UNKNOWN")
-                print(f"☁️ Cloud API Response: {status}")
+            r = requests.post(API_TELEMETRY_ENDPOINT, json=payload, timeout=5)
+            if r.status_code == 200:
+                result = r.json()
+                print(f"☁️  Cloud ACK: {result.get('child_status', 'UNKNOWN')}")
                 return True
             else:
-                print(f"❌ Cloud API Error: {response.status_code}")
+                print(f"❌ Cloud HTTP {r.status_code}: {r.text[:120]}")
                 return False
         except requests.exceptions.ConnectionError:
-            print(f"❌ Cannot connect to cloud API. Is {CLOUD_API_BASE_URL} running?")
+            print(f"❌ Cannot reach {CLOUD_API_BASE_URL} — is the Render service awake?")
             return False
-        except Exception as e:
-            print(f"❌ API Error: {e}")
+        except Exception as exc:
+            print(f"❌ POST error: {exc}")
             return False
 
+    async def send_to_cloud(self, payload: Dict) -> bool:
+        # FIX: run blocking HTTP call in a thread so the BLE event loop isn't stalled
+        return await asyncio.to_thread(self._post_sync, payload)
+
+    # ── Connectivity pre-check ────────────────────────────────────────────────
+    async def check_cloud_connectivity(self):
+        print(f"🌐 Checking Render connectivity → {API_HEALTH_ENDPOINT}")
+        try:
+            r = await asyncio.to_thread(
+                lambda: requests.get(API_HEALTH_ENDPOINT, timeout=10)
+            )
+            if r.status_code == 200:
+                print(f"✅ Render reachable: {r.json()}")
+            else:
+                print(f"⚠️  Render responded with HTTP {r.status_code}")
+        except Exception as exc:
+            print(f"⚠️  Render health check failed: {exc}")
+            print("    The scanner will still run — posts may fail until Render wakes up.")
+
+    # ── Main scan loop ────────────────────────────────────────────────────────
     async def start_scanning(self):
-        """
-        Starts continuous BLE scanning and sends data to cloud API.
-        """
-        print(f"🔍 Starting BLE scanner - tracking: {TARGET_NAME}")
-        print(f"☁️ Cloud API: {CLOUD_API_BASE_URL}")
+        print(f"🔍 BLE Scanner starting — tracking: {TARGET_NAME}")
+        print(f"☁️  Target API: {CLOUD_API_BASE_URL}")
+
+        await self.check_cloud_connectivity()
 
         scanner = BleakScanner(detection_callback=self.detection_callback)
         await scanner.start()
-
         self.running = True
 
         try:
             while self.running:
-                payload = await self.calculate_rssi_status()
+                payload = await self.calculate_status()
                 await self.send_to_cloud(payload)
                 await asyncio.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt:
-            print("\n⏹️ Stopping scanner...")
+            print("\n⏹️  Stopping scanner…")
         finally:
             await scanner.stop()
             self.running = False
+            print("🛑 BLE scanner stopped.")
 
     def stop_scanning(self):
-        """Stops the scanner"""
         self.running = False
 
 
+# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 async def main():
-    """Main entry point for local BLE scanner"""
     scanner = LocalBLEScanner()
     await scanner.start_scanning()
 
