@@ -3,7 +3,7 @@ import requests
 from bleak import BleakScanner
 from collections import deque
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 TARGET_NAME = "Melody's A07"       # BLE advertisement name to track
@@ -20,9 +20,13 @@ MIN_CONSECUTIVE_FOR_BREACH = 5     # missed cycles before BREACH
 SCAN_INTERVAL              = 1.0   # seconds between telemetry posts
 
 
-CLOUD_API_BASE_URL     = "http://localhost:8000"
-API_TELEMETRY_ENDPOINT = f"{CLOUD_API_BASE_URL}/api/telemetry"
-API_HEALTH_ENDPOINT    = f"{CLOUD_API_BASE_URL}/health"
+CLOUD_TARGETS = {
+    "local":  "http://localhost:8000",
+    "render": "https://hedge-trial.onrender.com",   # ← change to your real Render URL
+}
+
+REQUEST_TIMEOUT = 5      # seconds, per-target HTTP timeout
+RENDER_TIMEOUT   = 12     # Render free-tier instances can be slow to wake from sleep
 
 
 # ─── SCANNER CLASS ───────────────────────────────────────────────────────────
@@ -33,6 +37,10 @@ class LocalBLEScanner:
         self.last_status            = "INIT"
         self.last_seen_time         = datetime.now()
         self.running                = False
+
+        # Per-target health tracking so we can log "target X has been down
+        # for N cycles" instead of spamming identical error lines.
+        self._target_failure_streak: Dict[str, int] = {name: 0 for name in CLOUD_TARGETS}
 
     # ── BLE callback ─────────────────────────────────────────────────────────
     async def detection_callback(self, device, adv_data):
@@ -69,14 +77,13 @@ class LocalBLEScanner:
             else -120
         )
 
-        # ── FIX: clear status vocabulary ─────────────────────────────────────
         if elapsed <= 2.5:
             # Beacon was seen recently
             if avg_rssi >= STRONG_THRESHOLD:
                 status = "SECURE"
                 msg    = "Phone inside safe perimeter"
             elif avg_rssi >= WEAK_THRESHOLD:
-                status = "WEAK"                         # ← was "NOT_FOUND" — fixed
+                status = "WEAK"
                 msg    = "Signal weak — move closer"
             else:
                 status = "BREACH"
@@ -110,48 +117,89 @@ class LocalBLEScanner:
             "message":    msg,
         }
 
-    # ── HTTP POST (thread-pool safe) ──────────────────────────────────────────
-    def _post_sync(self, payload: Dict) -> bool:
-        """Synchronous POST — called via asyncio.to_thread to avoid blocking."""
+    # ── HTTP POST (thread-pool safe, single target) ──────────────────────────
+    def _post_sync(self, name: str, base_url: str, payload: Dict) -> bool:
+        """
+        Synchronous POST to ONE target — called via asyncio.to_thread so it
+        never blocks the BLE event loop. Failures here are caught and
+        reported but never raised, so one bad target can't take down the
+        other dispatch tasks running alongside it.
+        """
+        endpoint = f"{base_url}/api/telemetry"
+        timeout  = RENDER_TIMEOUT if name == "render" else REQUEST_TIMEOUT
         try:
-            r = requests.post(API_TELEMETRY_ENDPOINT, json=payload, timeout=5)
+            r = requests.post(endpoint, json=payload, timeout=timeout)
             if r.status_code == 200:
                 result = r.json()
-                print(f"☁️  Cloud ACK: {result.get('child_status', 'UNKNOWN')}")
+                self._target_failure_streak[name] = 0
+                print(f"☁️  [{name}] ACK: {result.get('child_status', 'UNKNOWN')}")
                 return True
             else:
-                print(f"❌ Cloud HTTP {r.status_code}: {r.text[:120]}")
+                self._target_failure_streak[name] += 1
+                print(f"❌ [{name}] HTTP {r.status_code}: {r.text[:120]}")
                 return False
         except requests.exceptions.ConnectionError:
-            print(f"❌ Cannot reach {CLOUD_API_BASE_URL} — is cloud_api_server.py running?")
+            self._target_failure_streak[name] += 1
+            streak = self._target_failure_streak[name]
+            # Only print the full hint occasionally to avoid log spam once a
+            # target has clearly been down for a while.
+            if streak <= 3 or streak % 30 == 0:
+                print(f"❌ [{name}] Cannot reach {base_url} (fail streak: {streak})")
+            return False
+        except requests.exceptions.Timeout:
+            self._target_failure_streak[name] += 1
+            print(f"⏱️  [{name}] Timed out after {timeout}s")
             return False
         except Exception as exc:
-            print(f"❌ POST error: {exc}")
+            self._target_failure_streak[name] += 1
+            print(f"❌ [{name}] POST error: {exc}")
             return False
 
-    async def send_to_cloud(self, payload: Dict) -> bool:
-        # FIX: run blocking HTTP call in a thread so the BLE event loop isn't stalled
-        return await asyncio.to_thread(self._post_sync, payload)
+    # ── Fan-out dispatch to every configured target ─────────────────────────
+    async def send_to_targets(self, payload: Dict) -> Dict[str, bool]:
+        """
+        Sends the SAME payload to every entry in CLOUD_TARGETS concurrently.
+        Each target runs in its own thread so a slow/down target (e.g. a
+        sleeping Render free instance) never delays delivery to the others —
+        local DB logging and local frontend broadcast happen on their own
+        timeline regardless of what Render is doing.
+        """
+        tasks = {
+            name: asyncio.to_thread(self._post_sync, name, base_url, payload)
+            for name, base_url in CLOUD_TARGETS.items()
+        }
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        return {
+            name: (res is True)
+            for name, res in zip(tasks.keys(), results)
+        }
 
-    # ── Connectivity pre-check ────────────────────────────────────────────────
+    # ── Connectivity pre-check (all targets) ─────────────────────────────────
     async def check_cloud_connectivity(self):
-        print(f"🌐 Checking server connectivity → {API_HEALTH_ENDPOINT}")
-        try:
-            r = await asyncio.to_thread(
-                lambda: requests.get(API_HEALTH_ENDPOINT, timeout=10)
-            )
-            if r.status_code == 200:
-                print(f"✅ Server reachable: {r.json()}")
-            else:
-                print(f"⚠️  Server responded with HTTP {r.status_code}")
-        except Exception as exc:
-            print(f"⚠️  Health check failed: {exc}")
-            print("    Make sure cloud_api_server.py is running first (python cloud_api_server.py).")
+        for name, base_url in CLOUD_TARGETS.items():
+            health_url = f"{base_url}/health"
+            timeout    = RENDER_TIMEOUT if name == "render" else REQUEST_TIMEOUT
+            print(f"🌐 [{name}] Checking → {health_url}")
+            try:
+                r = await asyncio.to_thread(
+                    lambda u=health_url, t=timeout: requests.get(u, timeout=t)
+                )
+                if r.status_code == 200:
+                    print(f"✅ [{name}] Reachable: {r.json()}")
+                else:
+                    print(f"⚠️  [{name}] Responded with HTTP {r.status_code}")
+            except Exception as exc:
+                print(f"⚠️  [{name}] Health check failed: {exc}")
+                if name == "local":
+                    print("    Make sure cloud_api_server.py is running locally first.")
+                else:
+                    print("    Render free-tier instances can take 30-60s to wake up — this is normal on first ping.")
 
     # ── Main scan loop ────────────────────────────────────────────────────────
     async def start_scanning(self):
         print(f"🔍 BLE Scanner starting — tracking: {TARGET_NAME}")
-        print(f"☁️  Target API: {CLOUD_API_BASE_URL}")
+        for name, base_url in CLOUD_TARGETS.items():
+            print(f"☁️  Target [{name}]: {base_url}")
 
         await self.check_cloud_connectivity()
 
@@ -162,7 +210,11 @@ class LocalBLEScanner:
         try:
             while self.running:
                 payload = await self.calculate_status()
-                await self.send_to_cloud(payload)
+                outcome = await self.send_to_targets(payload)
+                ok   = [n for n, success in outcome.items() if success]
+                fail = [n for n, success in outcome.items() if not success]
+                if fail:
+                    print(f"   ↳ delivered: {ok or '—'} | failed: {fail}")
                 await asyncio.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt:
             print("\n⏹️  Stopping scanner…")
