@@ -17,6 +17,8 @@ BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DATABASE_PATH = os.path.join(BASE_DIR, "hedge_tracker.db")
 DATABASE_URL  = f"sqlite:///{DATABASE_PATH}"
 
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "local")
+
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -84,11 +86,11 @@ def initialize_and_seed_database():
             ))
             db.commit()
 
-        print("💾 Database initialised and seeded successfully.")
-        print(f"💾 DB file location → {DATABASE_PATH}")
+        print(f"💾 [{INSTANCE_NAME}] Database initialised and seeded successfully.")
+        print(f"💾 [{INSTANCE_NAME}] DB file location → {DATABASE_PATH}")
     except Exception as exc:
         db.rollback()
-        print(f"⚠️  Seed warning: {exc}")
+        print(f"⚠️  [{INSTANCE_NAME}] Seed warning: {exc}")
     finally:
         db.close()
 
@@ -102,8 +104,9 @@ def log_telemetry_to_db(
     threshold: int,
 ):
     """
-    Persists one telemetry row to SQLite.
-    Uses explicit rollback on failure so the session never stays dirty.
+    Persists one telemetry row to THIS instance's SQLite file.
+    Local and Render each write to their own separate hedge_tracker.db —
+    there is no shared database, by design.
     """
     db = SessionLocal()
     try:
@@ -119,10 +122,10 @@ def log_telemetry_to_db(
         )
         db.add(entry)
         db.commit()
-        print(f"💾 DB write OK — {child_name} | {rssi} dBm | {status}")
+        print(f"💾 [{INSTANCE_NAME}] DB write OK — {child_name} | {rssi} dBm | {status}")
     except Exception as exc:
         db.rollback()
-        print(f"❌ DB write error: {exc}")
+        print(f"❌ [{INSTANCE_NAME}] DB write error: {exc}")
     finally:
         db.close()
 
@@ -149,15 +152,16 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active_connections.append(ws)
-        print(f"🔌 WS client connected — total: {len(self.active_connections)}")
+        print(f"🔌 [{INSTANCE_NAME}] WS client connected — total: {len(self.active_connections)}")
 
     def disconnect(self, ws: WebSocket):
         if ws in self.active_connections:
             self.active_connections.remove(ws)
-            print(f"🔌 WS client removed — total: {len(self.active_connections)}")
+            print(f"🔌 [{INSTANCE_NAME}] WS client removed — total: {len(self.active_connections)}")
 
     async def broadcast(self, payload: dict):
-        """Fan-out to all clients; prune stale connections on send failure."""
+        """Fan-out to all clients connected to THIS instance only; prune stale
+        connections on send failure."""
         dead: list[WebSocket] = []
         for ws in self.active_connections:
             try:
@@ -184,13 +188,13 @@ class BeaconPayload(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     initialize_and_seed_database()
-    print("✅ Hedge Cloud API started — waiting for BLE telemetry...")
+    print(f"✅ [{INSTANCE_NAME}] Hedge Cloud API started — waiting for BLE telemetry...")
     yield
-    print("🛑 Hedge Cloud API shutting down.")
+    print(f"🛑 [{INSTANCE_NAME}] Hedge Cloud API shutting down.")
 
 
 # ─── FASTAPI APP ──────────────────────────────────────────────────────────────
-app = FastAPI(title="Hedge Cloud API", version="1.1", lifespan=lifespan)
+app = FastAPI(title=f"Hedge Cloud API [{INSTANCE_NAME}]", version="1.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -211,16 +215,23 @@ def serve_frontend():
 
 @app.get("/health")
 def health_check():
-    return {"status": "Hedge Cloud API is Running", "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "status": "Hedge Cloud API is Running",
+        "instance": INSTANCE_NAME,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 @app.post("/api/telemetry")
 async def receive_telemetry(payload: BeaconPayload):
     """
     Accepts processed RSSI data from local_ble_scanner.py.
-    Persists to SQLite, then fans out to all connected WebSocket clients.
+    The scanner posts to MULTIPLE instances of this same service (e.g. one
+    local, one on Render) — each instance independently persists to its own
+    SQLite file and broadcasts only to the WebSocket clients connected to it.
+    There is no cross-instance awareness or sync by design.
     """
-    # 1. Persist to database
+    # 1. Persist to THIS instance's database
     log_telemetry_to_db(
         child_id   = payload.child_id,
         child_name = payload.child_name,
@@ -230,7 +241,7 @@ async def receive_telemetry(payload: BeaconPayload):
         threshold  = STRONG_THRESHOLD,
     )
 
-    # 2. Broadcast downstream to the browser dashboard
+    # 2. Broadcast downstream to whoever is connected to THIS instance's frontend
     await manager.broadcast({
         "child_id":   payload.child_id,
         "child_name": payload.child_name,
@@ -239,14 +250,14 @@ async def receive_telemetry(payload: BeaconPayload):
         "message":    payload.message,
     })
 
-    print(f"📊 Telemetry → {payload.child_name} | {payload.rssi} dBm | {payload.status}")
-    return {"status": "Processed", "child_status": payload.status}
+    print(f"📊 [{INSTANCE_NAME}] Telemetry → {payload.child_name} | {payload.rssi} dBm | {payload.status}")
+    return {"status": "Processed", "instance": INSTANCE_NAME, "child_status": payload.status}
 
 
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Real-time dashboard endpoint.
+    Real-time dashboard endpoint, scoped to THIS instance only.
     On connect: replays the last known DB record so the UI is never blank.
     While open: echoes keep-alive heartbeats every 25 s to survive Render's
                 proxy idle timeout (~30 s).
@@ -274,7 +285,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message":    "System online — waiting for scanner telemetry...",
             })
     except Exception as exc:
-        print(f"⚠️  Backfill error: {exc}")
+        print(f"⚠️  [{INSTANCE_NAME}] Backfill error: {exc}")
 
     # ── Keep-alive loop ──────────────────────────────────────────────────────
     try:
@@ -290,12 +301,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-        print("🔌 WebSocket client disconnected cleanly.")
+        print(f"🔌 [{INSTANCE_NAME}] WebSocket client disconnected cleanly.")
     except Exception as exc:
         manager.disconnect(websocket)
-        print(f"⚠️  WebSocket dropped: {exc}")
+        print(f"⚠️  [{INSTANCE_NAME}] WebSocket dropped: {exc}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("cloud_api_server:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 8000))   # Render injects PORT at runtime
+    print(f"🚀 Starting Hedge Cloud API as instance: '{INSTANCE_NAME}' on port {port}")
+    uvicorn.run("cloud_api_server:app", host="0.0.0.0", port=port, reload=False)
