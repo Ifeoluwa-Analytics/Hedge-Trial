@@ -15,12 +15,7 @@ STRONG_THRESHOLD = -70          # ≥ this  → SECURE
 WEAK_THRESHOLD   = -100         # ≥ this  → WEAK   (else BREACH/LOST)
 
 # ── Smoothing ────────────────────────────────────────────────────────────────
-# OLD APPROACH (removed): a 5-sample sliding-window mean. That meant the
-# reported RSSI was an average of up to 5 *past* readings, so when the phone
-# moved (closer or farther) the status lagged several seconds behind reality
-# — this was the cause of "near but shows WEAK" / "far but shows SECURE".
-#
-# NEW APPROACH: an EMA (exponential moving average) updated on *every*
+# EMA (exponential moving average) updated on *every*
 # advertisement the instant it's received (not once per poll cycle). Recent
 # readings dominate immediately, so status tracks real movement closely,
 # while still smoothing out single-packet jitter (±3-5 dBm).
