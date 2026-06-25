@@ -38,9 +38,13 @@ class LocalBLEScanner:
         self.last_seen_time        = datetime.now()
         self.running               = False
 
-        # Track the previous avg_rssi so the backend can report direction
-        # of travel alongside each payload.
-        self._prev_avg_rssi: int | None = None
+        # Rolling history of avg_rssi values used to compute movement trend.
+        # We compare the newest average against the oldest in the window so
+        # short-term BLE jitter (±3-5 dBm per cycle) doesn't drown out the
+        # real movement signal.  A 6-cycle window at 1 s/cycle = 6 s of
+        # history; real walking speed changes RSSI by ~10-20 dBm over that
+        # span, which comfortably clears the dead-band below.
+        self._trend_history: deque = deque(maxlen=6)
 
         self._target_failure_streak: Dict[str, int] = {n: 0 for n in CLOUD_TARGETS}
 
@@ -88,9 +92,19 @@ class LocalBLEScanner:
         beacon_live = elapsed <= 2.5
 
         # ── Trend (direction of travel) ───────────────────────────────────────
-        DEAD_BAND = 2   # dBm; change smaller than this is treated as noise
-        if avg_rssi is not None and self._prev_avg_rssi is not None:
-            delta = avg_rssi - self._prev_avg_rssi   # positive = stronger = closer
+        # Push current avg into the history window, then compare newest vs
+        # oldest across the full 6-cycle span (~6 s at 1 s/cycle).
+        # A 5 dBm net change is needed to call a direction — large enough to
+        # ignore per-cycle BLE jitter (±3-5 dBm) but small enough to catch
+        # real movement within a few steps.
+        DEAD_BAND = 5   # dBm net change across the window to call a direction
+        if avg_rssi is not None:
+            self._trend_history.append(avg_rssi)
+
+        if len(self._trend_history) >= 2:
+            oldest = self._trend_history[0]
+            newest = self._trend_history[-1]
+            delta  = newest - oldest        # positive = stronger signal = closer
             if delta > DEAD_BAND:
                 trend = "approaching"
             elif delta < -DEAD_BAND:
@@ -99,10 +113,6 @@ class LocalBLEScanner:
                 trend = "steady"
         else:
             trend = "steady"
-
-        # Advance history only when we have a real reading
-        if avg_rssi is not None:
-            self._prev_avg_rssi = avg_rssi
 
         # ── Status & message ──────────────────────────────────────────────────
         if beacon_live:
