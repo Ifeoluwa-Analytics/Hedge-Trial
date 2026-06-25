@@ -3,7 +3,7 @@ import requests
 from bleak import BleakScanner
 from collections import deque
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 TARGET_NAME = "Melody's A07"
@@ -14,11 +14,23 @@ CHILD_NAME  = "Ifeoluwa Olaloye"
 STRONG_THRESHOLD = -70          # ≥ this  → SECURE
 WEAK_THRESHOLD   = -100         # ≥ this  → WEAK   (else BREACH/LOST)
 
-# Polling / smoothing
-RSSI_BUFFER_SIZE           = 5  # sliding-window size for avg RSSI
-MIN_CONSECUTIVE_FOR_LOST   = 5  # missed cycles (after buffer drains) → LOST
+# ── Smoothing ────────────────────────────────────────────────────────────────
+# OLD APPROACH (removed): a 5-sample sliding-window mean. That meant the
+# reported RSSI was an average of up to 5 *past* readings, so when the phone
+# moved (closer or farther) the status lagged several seconds behind reality
+# — this was the cause of "near but shows WEAK" / "far but shows SECURE".
+#
+# NEW APPROACH: an EMA (exponential moving average) updated on *every*
+# advertisement the instant it's received (not once per poll cycle). Recent
+# readings dominate immediately, so status tracks real movement closely,
+# while still smoothing out single-packet jitter (±3-5 dBm).
+EMA_ALPHA = 0.4   # higher = snappier / less smoothing, lower = smoother / slower
 
-SCAN_INTERVAL = 1.0             # seconds between telemetry posts
+# Time tiers for "how long since we last actually heard the beacon"
+NOT_FOUND_GRACE_SEC = 2.5    # below this → still considered "live"
+MIN_CONSECUTIVE_FOR_LOST = 5  # cycles of silence (after grace) → LOST
+SCAN_INTERVAL = 1.0          # seconds between telemetry posts
+LOST_AFTER_SEC = NOT_FOUND_GRACE_SEC + (MIN_CONSECUTIVE_FOR_LOST * SCAN_INTERVAL)
 
 CLOUD_TARGETS = {
     "local":  "http://localhost:8000",
@@ -32,18 +44,27 @@ RENDER_TIMEOUT  = 12
 # ─── SCANNER CLASS ───────────────────────────────────────────────────────────
 class LocalBLEScanner:
     def __init__(self):
-        self.rssi_buffer           = deque(maxlen=RSSI_BUFFER_SIZE)
+        # Continuously-updated EMA — this is now the single source of truth
+        # for "what is the signal doing right now". Updated in the BLE
+        # callback itself, not on the 1Hz poll loop, so it's never more than
+        # one advertisement-interval stale.
+        self.smoothed_rssi: Optional[float] = None
+
+        # Frozen snapshot of the last EMA value seen while "live". Used for
+        # display/decisions during the FADING tier (beacon recently lost)
+        # WITHOUT being recomputed from stale data — it just doesn't change
+        # until either a fresh reading arrives or we give up and go LOST.
+        self.last_known_rssi: Optional[int] = None
+
         self.consecutive_not_found = 0
         self.last_status           = "INIT"
         self.last_seen_time        = datetime.now()
         self.running               = False
 
-        # Rolling history of avg_rssi values used to compute movement trend.
-        # We compare the newest average against the oldest in the window so
-        # short-term BLE jitter (±3-5 dBm per cycle) doesn't drown out the
-        # real movement signal.  A 6-cycle window at 1 s/cycle = 6 s of
-        # history; real walking speed changes RSSI by ~10-20 dBm over that
-        # span, which comfortably clears the dead-band below.
+        # Rolling history of EMA snapshots (one per poll cycle, only while
+        # live) used to compute movement trend. Comparing newest vs oldest
+        # across this window filters out per-cycle jitter while still
+        # catching real movement within a few seconds.
         self._trend_history: deque = deque(maxlen=6)
 
         self._target_failure_streak: Dict[str, int] = {n: 0 for n in CLOUD_TARGETS}
@@ -54,37 +75,36 @@ class LocalBLEScanner:
         if name and TARGET_NAME.lower() in name.lower():
             self.consecutive_not_found = 0
             self.last_seen_time        = datetime.now()
-            self.rssi_buffer.append(adv_data.rssi)
-            print(f"📡 Beacon detected: {name} | RSSI: {adv_data.rssi} dBm")
+
+            # Update EMA immediately — this is what fixes the lag. A single
+            # strong reading right after a weak streak pulls the EMA up by
+            # EMA_ALPHA's worth straight away, instead of waiting for 5
+            # samples to cycle through a buffer.
+            if self.smoothed_rssi is None:
+                self.smoothed_rssi = float(adv_data.rssi)
+            else:
+                self.smoothed_rssi = (
+                    EMA_ALPHA * adv_data.rssi + (1 - EMA_ALPHA) * self.smoothed_rssi
+                )
+
+            print(f"📡 Beacon detected: {name} | RSSI: {adv_data.rssi} dBm | EMA: {round(self.smoothed_rssi)} dBm")
 
     # ── Status calculation ────────────────────────────────────────────────────
     async def calculate_status(self) -> Dict:
-      
         elapsed = (datetime.now() - self.last_seen_time).total_seconds()
+        beacon_live = elapsed <= NOT_FOUND_GRACE_SEC
 
-        # Age out the buffer one value per missed cycle
-        if elapsed > 2.5:
+        if not beacon_live:
             self.consecutive_not_found += 1
-            if self.rssi_buffer:
-                self.rssi_buffer.popleft()
-
-        buffer_empty = len(self.rssi_buffer) == 0
-        avg_rssi = (
-            round(sum(self.rssi_buffer) / len(self.rssi_buffer))
-            if not buffer_empty
-            else None        # None = truly no data; frontend shows '--'
-        )
-        beacon_live = elapsed <= 2.5
 
         # ── Trend (direction of travel) ───────────────────────────────────────
-        # Push current avg into the history window, then compare newest vs
-        # oldest across the full 6-cycle span (~6 s at 1 s/cycle).
-        # A 5 dBm net change is needed to call a direction — large enough to
-        # ignore per-cycle BLE jitter (±3-5 dBm) but small enough to catch
-        # real movement within a few steps.
-        DEAD_BAND = 5   # dBm net change across the window to call a direction
-        if avg_rssi is not None:
-            self._trend_history.append(avg_rssi)
+        # Sample the EMA once per cycle into a slower window purely for
+        # computing movement direction. A 5 dBm net change across the window
+        # is needed to call a direction — large enough to ignore jitter but
+        # small enough to catch real movement within a few seconds.
+        DEAD_BAND = 5
+        if beacon_live and self.smoothed_rssi is not None:
+            self._trend_history.append(self.smoothed_rssi)
 
         if len(self._trend_history) >= 2:
             oldest = self._trend_history[0]
@@ -101,33 +121,50 @@ class LocalBLEScanner:
 
         # ── Status & message ──────────────────────────────────────────────────
         if beacon_live:
-            if avg_rssi is not None and avg_rssi >= STRONG_THRESHOLD:
+            # LIVE tier: trust the EMA, it's at most one advertisement old.
+            current_rssi = round(self.smoothed_rssi) if self.smoothed_rssi is not None else None
+            self.last_known_rssi = current_rssi
+
+            if current_rssi is not None and current_rssi >= STRONG_THRESHOLD:
                 status = "SECURE"
                 msg    = "Phone inside safe perimeter"
-            elif avg_rssi is not None and avg_rssi >= WEAK_THRESHOLD:
+            elif current_rssi is not None and current_rssi >= WEAK_THRESHOLD:
                 status = "WEAK"
                 msg    = "Signal weak — move closer"
             else:
                 status = "BREACH"
                 msg    = "Signal critically low!"
-        else:
-            if self.consecutive_not_found >= MIN_CONSECUTIVE_FOR_LOST and buffer_empty:
-                # Buffer fully drained AND enough time has passed → LOST
-                status   = "LOST"
-                msg      = "Beacon signal lost"
-                avg_rssi = None          # explicit null for frontend
-            elif not buffer_empty and avg_rssi >= WEAK_THRESHOLD:
+
+        elif elapsed <= LOST_AFTER_SEC:
+            # FADING tier: beacon hasn't been heard this cycle, but we
+            # haven't given up yet. Use the FROZEN last-known reading (do
+            # NOT recompute an average from old samples) so we don't get
+            # the old bug where stale strong values kept reporting SECURE
+            # well after the phone had actually left range.
+            current_rssi = self.last_known_rssi
+            if current_rssi is not None and current_rssi >= WEAK_THRESHOLD:
                 status = "WEAK"
                 msg    = "Signal weak — beacon drifting out of range"
             else:
                 status   = "BREACH"
                 msg      = "Beacon NOT DETECTED"
-                avg_rssi = None
+                current_rssi = None
+
+        else:
+            # LOST tier: silence has gone on too long — stop pretending we
+            # know anything and report it plainly. Reset EMA so the next
+            # detection starts clean instead of being dragged by ancient data.
+            status        = "LOST"
+            msg           = "Beacon signal lost"
+            current_rssi  = None
+            self.smoothed_rssi   = None
+            self.last_known_rssi = None
+            self._trend_history.clear()
 
         self.last_status = status
 
         if beacon_live:
-            print(f"📱 {CHILD_NAME} | RSSI: {avg_rssi} dBm | {status} | trend: {trend}")
+            print(f"📱 {CHILD_NAME} | RSSI: {current_rssi} dBm | {status} | trend: {trend}")
         else:
             print(
                 f"🚫 {CHILD_NAME} | NOT SEEN | {status} "
@@ -137,7 +174,7 @@ class LocalBLEScanner:
         return {
             "child_id":   CHILD_ID,
             "child_name": CHILD_NAME,
-            "rssi":       avg_rssi,    # None → frontend shows '--'
+            "rssi":       current_rssi,    # None → frontend shows '--'
             "status":     status,
             "message":    msg,
             "trend":      trend,       # 'approaching' | 'departing' | 'steady'
