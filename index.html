@@ -48,6 +48,18 @@
                         <p id="status-val" class="text-lg font-bold text-emerald-400">STANDBY</p>
                     </div>
                 </div>
+
+                <!-- ── Estimated distance pill ──────────────────────────────────────
+                     Mirrors the mobile mockup's "4.2m from parent · Within safe zone"
+                     chip. Hidden until the first real reading arrives. -->
+                <div id="distance-pill"
+                     class="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full
+                            bg-emerald-500/10 border border-emerald-500/30 hidden">
+                    <span id="distance-dot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    <span id="distance-text" class="text-sm font-medium text-emerald-300">
+                        -- m from parent · Within safe zone
+                    </span>
+                </div>
             </div>
         </main>
 
@@ -81,6 +93,9 @@
     const statusVal       = document.getElementById('status-val');
     const emergencyAction = document.getElementById('emergency-action');
     const alarmSound      = document.getElementById('alarm-sound');
+    const distancePill    = document.getElementById('distance-pill');
+    const distanceDot     = document.getElementById('distance-dot');
+    const distanceText    = document.getElementById('distance-text');
 
     // ─── AUDIO UNLOCK ────────────────────────────────────────────────────────
     // Mobile browsers (Safari, Chrome-Android) require a user gesture before
@@ -103,30 +118,70 @@
         // In production: POST to /api/escalate or send SMS via backend.
     }
 
-    // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
-    // Maps every status the server can send to a visual theme.
-    // FIX: "NOT_FOUND" was missing from the yellow/warning branch in the
-    //      original code, so the UI silently did nothing on that state.
+    // ─── RSSI → DISTANCE ESTIMATION ──────────────────────────────────────────
+    // Standard log-distance path-loss model:
+    //   distance = 10 ^ ((measuredPower - rssi) / (10 * N))
+    // measuredPower = calibrated RSSI at 1 metre for this beacon type.
+    // N             = environmental path-loss exponent (2 = free space,
+    //                 2.7-4 = indoors with walls/bodies/interference).
+    // These are estimates, not precise measurements — BLE RSSI is inherently
+    // noisy, so treat the output as "roughly how far", not a ruler reading.
+    const MEASURED_POWER_AT_1M = -52;
+    const PATH_LOSS_EXPONENT   = 2.5;
 
-    function applyTheme(status) {
+    function rssiToDistance(rssi) {
+        if (rssi === undefined || rssi === null) return null;
+        const distance = Math.pow(10, (MEASURED_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT));
+        return Math.round(distance * 10) / 10;   // one decimal place
+    }
+
+    function formatDistance(metres) {
+        if (metres === null) return '-- m';
+        // Past ~100m the model is just noise dressed up as precision —
+        // round to whole metres so it doesn't read as falsely exact.
+        return metres < 100 ? `${metres.toFixed(1)}m` : `${Math.round(metres)}m`;
+    }
+
+    // Tracks the last distance we actually trusted (i.e. computed while the
+    // beacon was live), so LOST/BREACH can keep showing "last seen" instead
+    // of collapsing to "--".
+    let lastKnownDistance = null;
+    let lastKnownTime     = null;
+
+    // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
+    // Maps every status the server can send to a visual theme AND to the
+    // distance-pill's copy/color, kept in lock-step so they always agree.
+
+    function applyTheme(status, rssi) {
         // Reset shared elements first
         emergencyAction.classList.add('hidden');
         alarmSound.pause();
 
         switch (status) {
 
-            case 'SECURE':
+            case 'SECURE': {
                 bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
                 statusDot.className   = 'w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl';
                 statusPulse.className = 'w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse';
                 statusVal.className   = 'text-lg font-bold text-emerald-400';
                 statusDot.textContent = '📡';
-                break;
 
-            // ── FIX: backend sends "NOT_FOUND" for weak/searching state ──────
+                const d = rssiToDistance(rssi);
+                lastKnownDistance = d;
+                lastKnownTime     = new Date();
+                showDistancePill(
+                    'emerald',
+                    `${formatDistance(d)} from parent · Within safe zone`
+                );
+                break;
+            }
+
+            // ── backend sends "NOT_FOUND" for the brief searching window
+            //    before MIN_CONSECUTIVE_FOR_BREACH is reached, and "WEAK"
+            //    for a live-but-fading signal — both render the same way ──
             case 'NOT_FOUND':
-            case 'WEAK':
+            case 'WEAK': {
                 bodyBg.className      = 'bg-yellow-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-yellow-900/80 rounded-3xl p-8 text-center shadow-2xl border border-yellow-500 transition-all duration-500';
                 statusDot.className   = 'w-12 h-12 rounded-full bg-yellow-500 flex items-center justify-center text-2xl animate-bounce';
@@ -134,10 +189,32 @@
                 statusVal.className   = 'text-lg font-bold text-yellow-200';
                 statusDot.textContent = '⚠️';
                 emergencyAction.classList.remove('hidden');
+
+                if (status === 'WEAK') {
+                    // Beacon is still live, just fading — distance is current.
+                    const d = rssiToDistance(rssi);
+                    lastKnownDistance = d;
+                    lastKnownTime     = new Date();
+                    showDistancePill(
+                        'yellow',
+                        `${formatDistance(d)} from parent · Departing safe zone`
+                    );
+                } else {
+                    // NOT_FOUND: beacon has dropped out very recently and we
+                    // don't have a fresh RSSI yet — hold the last trusted
+                    // reading rather than guessing from a stale buffer.
+                    showDistancePill(
+                        'yellow',
+                        lastKnownDistance !== null
+                            ? `Last seen ${formatDistance(lastKnownDistance)} · Departing safe zone`
+                            : 'Searching for beacon…'
+                    );
+                }
                 break;
+            }
 
             case 'BREACH':
-            case 'LOST':
+            case 'LOST': {
                 bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
                 statusDot.className   = 'w-12 h-12 rounded-full bg-red-500 flex items-center justify-center text-2xl';
@@ -146,18 +223,65 @@
                 statusDot.textContent = '🚨';
                 emergencyAction.classList.remove('hidden');
                 if (audioUnlocked) alarmSound.play().catch(() => {});
+
+                // Freeze on the last trusted distance/time — never recompute
+                // from the placeholder -120 dBm the backend sends for BREACH.
+                const timeLabel = lastKnownTime
+                    ? lastKnownTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    : null;
+                showDistancePill(
+                    'red',
+                    lastKnownDistance !== null
+                        ? `Last seen ${formatDistance(lastKnownDistance)}${timeLabel ? ` · ${timeLabel}` : ''}`
+                        : 'Beacon not detected'
+                );
                 break;
+            }
 
             case 'INIT':
-            default:
+            default: {
                 bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
                 statusDot.className   = 'w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center text-2xl animate-pulse';
                 statusPulse.className = 'w-24 h-24 rounded-full bg-blue-500/20 flex items-center justify-center';
                 statusVal.className   = 'text-lg font-bold text-blue-400';
                 statusDot.textContent = '🔍';
+                hideDistancePill();
                 break;
+            }
         }
+    }
+
+    // ── Distance pill helpers ─────────────────────────────────────────────────
+    const PILL_THEMES = {
+        emerald: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30',
+            dot:  'w-2 h-2 rounded-full bg-emerald-400',
+            text: 'text-sm font-medium text-emerald-300',
+        },
+        yellow: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-yellow-500/10 border border-yellow-500/40',
+            dot:  'w-2 h-2 rounded-full bg-yellow-400',
+            text: 'text-sm font-medium text-yellow-200',
+        },
+        red: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 border border-red-500/40',
+            dot:  'w-2 h-2 rounded-full bg-red-400',
+            text: 'text-sm font-medium text-red-200',
+        },
+    };
+
+    function showDistancePill(theme, text) {
+        const t = PILL_THEMES[theme] || PILL_THEMES.emerald;
+        distancePill.className = t.wrap;
+        distanceDot.className  = t.dot;
+        distanceText.className = t.text;
+        distanceText.textContent = text;
+        distancePill.classList.remove('hidden');
+    }
+
+    function hideDistancePill() {
+        distancePill.classList.add('hidden');
     }
 
     // ─── WEBSOCKET ────────────────────────────────────────────────────────────
@@ -187,7 +311,7 @@
 
             console.log('📥 [HEDGE] Packet:', data);
 
-            // ── FIX: guard HEARTBEAT BEFORE touching DOM ──────────────────
+            // ── guard HEARTBEAT BEFORE touching DOM ───────────────────────
             if (data.status === 'HEARTBEAT') return;
 
             // Update text content
@@ -197,8 +321,8 @@
             systemMessage.textContent = data.message    || '';
             statusVal.textContent     = data.status     || 'UNKNOWN';
 
-            // Apply matching visual theme
-            applyTheme(data.status);
+            // Apply matching visual theme + distance pill
+            applyTheme(data.status, data.rssi);
         };
 
         socket.onclose = (e) => {
