@@ -59,22 +59,7 @@ class LocalBLEScanner:
 
     # ── Status calculation ────────────────────────────────────────────────────
     async def calculate_status(self) -> Dict:
-        """
-        Status contract
-        ───────────────
-        SECURE   beacon visible AND avg RSSI ≥ STRONG_THRESHOLD
-        WEAK     avg RSSI between WEAK_THRESHOLD and STRONG_THRESHOLD
-                 (whether beacon is live or buffer still holds values)
-        BREACH   beacon timed out, buffer still has sub-WEAK values
-                 OR beacon live but RSSI critically below WEAK_THRESHOLD
-        LOST     beacon gone long enough that buffer is exhausted AND
-                 consecutive misses ≥ MIN_CONSECUTIVE_FOR_LOST.
-                 rssi field is sent as null — UI shows '--'.
-
-        Payload also includes `trend`: 'approaching' | 'departing' | 'steady'
-        derived by comparing current avg_rssi to the previous cycle's value.
-        Dead-band of 2 dBm to suppress noise.
-        """
+      
         elapsed = (datetime.now() - self.last_seen_time).total_seconds()
 
         # Age out the buffer one value per missed cycle
