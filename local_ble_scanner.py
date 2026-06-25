@@ -3,7 +3,7 @@ import requests
 from bleak import BleakScanner
 from collections import deque
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 TARGET_NAME = "Melody's A07"
@@ -14,42 +14,17 @@ CHILD_NAME  = "Ifeoluwa Olaloye"
 STRONG_THRESHOLD = -70          # ≥ this  → SECURE
 WEAK_THRESHOLD   = -100         # ≥ this  → WEAK   (else BREACH/LOST)
 
-# ── Smoothing parameters ──────────────────────────────────────────────────────
-#
-#  Layer 1 — Outlier rejection (per raw reading, in detection_callback)
-#    A raw RSSI reading is dropped if it deviates more than OUTLIER_GATE dBm
-#    from the current smoothed value.  This stops a single bad antenna
-#    reflection from entering the pipeline at all.
-OUTLIER_GATE = 15               # dBm; raw readings outside ±this are discarded
+# Polling / smoothing
+RSSI_BUFFER_SIZE           = 5  # sliding-window size for avg RSSI
+MIN_CONSECUTIVE_FOR_LOST   = 5  # missed cycles (after buffer drains) → LOST
 
-#  Layer 2 — Exponential weighted moving average (EMA)
-#    Instead of a plain mean over the last N readings, we apply an EMA so
-#    recent readings count more but old readings fade gradually rather than
-#    dropping off a cliff when they leave the window.
-#    alpha=0.3 → new reading contributes 30 %, history 70 %.
-#    Lower alpha = smoother but slower to react; 0.25-0.35 is a good range
-#    for indoor BLE.
-EMA_ALPHA    = 0.3
-
-#  Layer 3 — Status hysteresis (in calculate_status)
-#    A status change is only confirmed once the candidate status has been
-#    stable for HYSTERESIS_CYCLES consecutive cycles.  This prevents the
-#    display from flipping between SECURE and WEAK when the EMA is hovering
-#    right at the boundary.
-HYSTERESIS_CYCLES = 3
-
-# Trend window / dead-band
-TREND_WINDOW  = 6               # cycles to span the oldest-vs-newest comparison
-TREND_DEADBAND = 5              # dBm net change across window to call a direction
-
-# Timing
-MIN_CONSECUTIVE_FOR_LOST = 5   # missed cycles after buffer drains → LOST
-SCAN_INTERVAL            = 1.0  # seconds between telemetry posts
+SCAN_INTERVAL = 1.0             # seconds between telemetry posts
 
 CLOUD_TARGETS = {
     "local":  "http://localhost:8000",
     "render": "https://hedge-trial.onrender.com",
 }
+
 REQUEST_TIMEOUT = 5
 RENDER_TIMEOUT  = 12
 
@@ -57,151 +32,130 @@ RENDER_TIMEOUT  = 12
 # ─── SCANNER CLASS ───────────────────────────────────────────────────────────
 class LocalBLEScanner:
     def __init__(self):
-        self.last_seen_time        = datetime.now()
+        self.rssi_buffer           = deque(maxlen=RSSI_BUFFER_SIZE)
         self.consecutive_not_found = 0
+        self.last_status           = "INIT"
+        self.last_seen_time        = datetime.now()
         self.running               = False
 
-        # Layer 2: EMA state — starts as None until first reading arrives
-        self._ema: Optional[float] = None
-
-        # Layer 3: hysteresis — track what status the EMA "wants" to be,
-        # and only commit once it has held for HYSTERESIS_CYCLES cycles
-        self._candidate_status: Optional[str] = None
-        self._candidate_count:  int           = 0
-        self._confirmed_status: str           = "INIT"
-
-        # Trend history: stores the committed EMA value each cycle so we
-        # can compare newest vs oldest across TREND_WINDOW cycles
-        self._trend_history: deque = deque(maxlen=TREND_WINDOW)
+        # Rolling history of avg_rssi values used to compute movement trend.
+        # We compare the newest average against the oldest in the window so
+        # short-term BLE jitter (±3-5 dBm per cycle) doesn't drown out the
+        # real movement signal.  A 6-cycle window at 1 s/cycle = 6 s of
+        # history; real walking speed changes RSSI by ~10-20 dBm over that
+        # span, which comfortably clears the dead-band below.
+        self._trend_history: deque = deque(maxlen=6)
 
         self._target_failure_streak: Dict[str, int] = {n: 0 for n in CLOUD_TARGETS}
 
-    # ── BLE callback — Layer 1: outlier rejection ─────────────────────────────
+    # ── BLE callback ─────────────────────────────────────────────────────────
     async def detection_callback(self, device, adv_data):
         name = adv_data.local_name or device.name
-        if not (name and TARGET_NAME.lower() in name.lower()):
-            return
-
-        raw = adv_data.rssi
-
-        # Reject raw readings that are implausibly far from the current EMA.
-        # On the very first reading there is no EMA yet, so we always accept.
-        if self._ema is not None and abs(raw - self._ema) > OUTLIER_GATE:
-            print(f"🗑️  Outlier dropped: {raw} dBm (EMA={self._ema:.1f}, gate=±{OUTLIER_GATE})")
-            return
-
-        # Update EMA — Layer 2
-        if self._ema is None:
-            self._ema = float(raw)          # seed with first real reading
-        else:
-            self._ema = EMA_ALPHA * raw + (1 - EMA_ALPHA) * self._ema
-
-        self.consecutive_not_found = 0
-        self.last_seen_time        = datetime.now()
-        print(f"📡 {name} | raw={raw} dBm  EMA={self._ema:.1f} dBm")
+        if name and TARGET_NAME.lower() in name.lower():
+            self.consecutive_not_found = 0
+            self.last_seen_time        = datetime.now()
+            self.rssi_buffer.append(adv_data.rssi)
+            print(f"📡 Beacon detected: {name} | RSSI: {adv_data.rssi} dBm")
 
     # ── Status calculation ────────────────────────────────────────────────────
     async def calculate_status(self) -> Dict:
         """
-        Smoothing pipeline summary
-        ──────────────────────────
-        1. Outlier rejection  — bad raw readings never reach the EMA
-        2. EMA               — smooth float representation of current signal
-        3. Hysteresis        — status only changes after N consecutive cycles
-                               in the new state; boundary jitter is invisible
-
         Status contract
         ───────────────
-        SECURE   EMA ≥ STRONG_THRESHOLD (confirmed)
-        WEAK     WEAK_THRESHOLD ≤ EMA < STRONG_THRESHOLD (confirmed)
-        BREACH   beacon timed out OR EMA < WEAK_THRESHOLD (confirmed)
-        LOST     beacon gone, EMA decayed to None (no data at all)
+        SECURE   beacon visible AND avg RSSI ≥ STRONG_THRESHOLD
+        WEAK     avg RSSI between WEAK_THRESHOLD and STRONG_THRESHOLD
+                 (whether beacon is live or buffer still holds values)
+        BREACH   beacon timed out, buffer still has sub-WEAK values
+                 OR beacon live but RSSI critically below WEAK_THRESHOLD
+        LOST     beacon gone long enough that buffer is exhausted AND
+                 consecutive misses ≥ MIN_CONSECUTIVE_FOR_LOST.
+                 rssi field is sent as null — UI shows '--'.
+
+        Payload also includes `trend`: 'approaching' | 'departing' | 'steady'
+        derived by comparing current avg_rssi to the previous cycle's value.
+        Dead-band of 2 dBm to suppress noise.
         """
-        elapsed     = (datetime.now() - self.last_seen_time).total_seconds()
+        elapsed = (datetime.now() - self.last_seen_time).total_seconds()
+
+        # Age out the buffer one value per missed cycle
+        if elapsed > 2.5:
+            self.consecutive_not_found += 1
+            if self.rssi_buffer:
+                self.rssi_buffer.popleft()
+
+        buffer_empty = len(self.rssi_buffer) == 0
+        avg_rssi = (
+            round(sum(self.rssi_buffer) / len(self.rssi_buffer))
+            if not buffer_empty
+            else None        # None = truly no data; frontend shows '--'
+        )
         beacon_live = elapsed <= 2.5
 
-        # ── Decay EMA when beacon is missing ─────────────────────────────────
-        # Rather than abruptly zeroing the EMA, nudge it toward -120 each
-        # missed cycle so the value degrades gracefully.  Rate chosen so the
-        # EMA crosses WEAK_THRESHOLD in ~5 missed cycles if it was at
-        # STRONG_THRESHOLD when the beacon disappeared.
-        if not beacon_live:
-            self.consecutive_not_found += 1
-            if self._ema is not None:
-                # Pull 15 % toward the floor each missed cycle
-                self._ema = 0.85 * self._ema + 0.15 * (-120)
+        # ── Trend (direction of travel) ───────────────────────────────────────
+        # Push current avg into the history window, then compare newest vs
+        # oldest across the full 6-cycle span (~6 s at 1 s/cycle).
+        # A 5 dBm net change is needed to call a direction — large enough to
+        # ignore per-cycle BLE jitter (±3-5 dBm) but small enough to catch
+        # real movement within a few steps.
+        DEAD_BAND = 5   # dBm net change across the window to call a direction
+        if avg_rssi is not None:
+            self._trend_history.append(avg_rssi)
 
-        # Round for display; None if we never received any reading
-        ema_rounded: Optional[int] = round(self._ema) if self._ema is not None else None
-
-        # ── Determine raw candidate status from EMA ───────────────────────────
-        if self._ema is None:
-            raw_candidate = "LOST"
-        elif not beacon_live and self.consecutive_not_found >= MIN_CONSECUTIVE_FOR_LOST and self._ema < WEAK_THRESHOLD:
-            raw_candidate = "LOST"
-        elif self._ema >= STRONG_THRESHOLD:
-            raw_candidate = "SECURE"
-        elif self._ema >= WEAK_THRESHOLD:
-            raw_candidate = "WEAK"
-        else:
-            raw_candidate = "BREACH"
-
-        # ── Layer 3: hysteresis ───────────────────────────────────────────────
-        # Count consecutive cycles where the EMA wants the same status.
-        # Only flip _confirmed_status once the candidate has held long enough.
-        # Exception: LOST and BREACH escalate immediately (safety-first).
-        if raw_candidate == self._candidate_status:
-            self._candidate_count += 1
-        else:
-            self._candidate_status = raw_candidate
-            self._candidate_count  = 1
-
-        immediate_escalation = raw_candidate in ("LOST", "BREACH")
-        if immediate_escalation or self._candidate_count >= HYSTERESIS_CYCLES:
-            self._confirmed_status = raw_candidate
-
-        status = self._confirmed_status
-
-        # ── Message text ─────────────────────────────────────────────────────
-        msg_map = {
-            "SECURE": "Phone inside safe perimeter",
-            "WEAK":   "Signal weak — move closer",
-            "BREACH": "Beacon NOT DETECTED",
-            "LOST":   "Beacon signal lost",
-        }
-        msg = msg_map.get(status, "Scanning…")
-
-        # For LOST, report rssi as None so the frontend shows '--'
-        rssi_out: Optional[int] = None if status == "LOST" else ema_rounded
-
-        # ── Trend ────────────────────────────────────────────────────────────
-        if ema_rounded is not None:
-            self._trend_history.append(ema_rounded)
-
-        trend = "steady"
         if len(self._trend_history) >= 2:
-            delta = self._trend_history[-1] - self._trend_history[0]
-            if delta > TREND_DEADBAND:
+            oldest = self._trend_history[0]
+            newest = self._trend_history[-1]
+            delta  = newest - oldest        # positive = stronger signal = closer
+            if delta > DEAD_BAND:
                 trend = "approaching"
-            elif delta < -TREND_DEADBAND:
+            elif delta < -DEAD_BAND:
                 trend = "departing"
+            else:
+                trend = "steady"
+        else:
+            trend = "steady"
 
-        # ── Console log ──────────────────────────────────────────────────────
-        ema_str = f"{self._ema:.1f}" if self._ema is not None else "None"
-        print(
-            f"{'📱' if beacon_live else '🚫'} {CHILD_NAME} | "
-            f"EMA={ema_str} dBm | confirmed={status} | "
-            f"candidate={self._candidate_status}×{self._candidate_count} | "
-            f"trend={trend}"
-        )
+        # ── Status & message ──────────────────────────────────────────────────
+        if beacon_live:
+            if avg_rssi is not None and avg_rssi >= STRONG_THRESHOLD:
+                status = "SECURE"
+                msg    = "Phone inside safe perimeter"
+            elif avg_rssi is not None and avg_rssi >= WEAK_THRESHOLD:
+                status = "WEAK"
+                msg    = "Signal weak — move closer"
+            else:
+                status = "BREACH"
+                msg    = "Signal critically low!"
+        else:
+            if self.consecutive_not_found >= MIN_CONSECUTIVE_FOR_LOST and buffer_empty:
+                # Buffer fully drained AND enough time has passed → LOST
+                status   = "LOST"
+                msg      = "Beacon signal lost"
+                avg_rssi = None          # explicit null for frontend
+            elif not buffer_empty and avg_rssi >= WEAK_THRESHOLD:
+                status = "WEAK"
+                msg    = "Signal weak — beacon drifting out of range"
+            else:
+                status   = "BREACH"
+                msg      = "Beacon NOT DETECTED"
+                avg_rssi = None
+
+        self.last_status = status
+
+        if beacon_live:
+            print(f"📱 {CHILD_NAME} | RSSI: {avg_rssi} dBm | {status} | trend: {trend}")
+        else:
+            print(
+                f"🚫 {CHILD_NAME} | NOT SEEN | {status} "
+                f"(missed: {self.consecutive_not_found}) | trend: {trend}"
+            )
 
         return {
             "child_id":   CHILD_ID,
             "child_name": CHILD_NAME,
-            "rssi":       rssi_out,
+            "rssi":       avg_rssi,    # None → frontend shows '--'
             "status":     status,
             "message":    msg,
-            "trend":      trend,
+            "trend":      trend,       # 'approaching' | 'departing' | 'steady'
         }
 
     # ── HTTP POST ─────────────────────────────────────────────────────────────
