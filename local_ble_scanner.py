@@ -15,7 +15,7 @@ STRONG_THRESHOLD = -70          # ≥ this  → SECURE
 WEAK_THRESHOLD   = -100         # ≥ this  → WEAK   (else BREACH/LOST)
 
 # ── Smoothing ────────────────────────────────────────────────────────────────
-# EMA (exponential moving average) updated on *every*
+# NEW APPROACH: an EMA (exponential moving average) updated on *every*
 # advertisement the instant it's received (not once per poll cycle). Recent
 # readings dominate immediately, so status tracks real movement closely,
 # while still smoothing out single-packet jitter (±3-5 dBm).
@@ -39,16 +39,9 @@ RENDER_TIMEOUT  = 12
 # ─── SCANNER CLASS ───────────────────────────────────────────────────────────
 class LocalBLEScanner:
     def __init__(self):
-        # Continuously-updated EMA — this is now the single source of truth
-        # for "what is the signal doing right now". Updated in the BLE
-        # callback itself, not on the 1Hz poll loop, so it's never more than
-        # one advertisement-interval stale.
+
         self.smoothed_rssi: Optional[float] = None
 
-        # Frozen snapshot of the last EMA value seen while "live". Used for
-        # display/decisions during the FADING tier (beacon recently lost)
-        # WITHOUT being recomputed from stale data — it just doesn't change
-        # until either a fresh reading arrives or we give up and go LOST.
         self.last_known_rssi: Optional[int] = None
 
         self.consecutive_not_found = 0
@@ -56,10 +49,8 @@ class LocalBLEScanner:
         self.last_seen_time        = datetime.now()
         self.running               = False
 
-        # Rolling history of EMA snapshots (one per poll cycle, only while
-        # live) used to compute movement trend. Comparing newest vs oldest
-        # across this window filters out per-cycle jitter while still
-        # catching real movement within a few seconds.
+        self._fresh_reading = False
+
         self._trend_history: deque = deque(maxlen=6)
 
         self._target_failure_streak: Dict[str, int] = {n: 0 for n in CLOUD_TARGETS}
@@ -71,16 +62,14 @@ class LocalBLEScanner:
             self.consecutive_not_found = 0
             self.last_seen_time        = datetime.now()
 
-            # Update EMA immediately — this is what fixes the lag. A single
-            # strong reading right after a weak streak pulls the EMA up by
-            # EMA_ALPHA's worth straight away, instead of waiting for 5
-            # samples to cycle through a buffer.
+    
             if self.smoothed_rssi is None:
                 self.smoothed_rssi = float(adv_data.rssi)
             else:
                 self.smoothed_rssi = (
                     EMA_ALPHA * adv_data.rssi + (1 - EMA_ALPHA) * self.smoothed_rssi
                 )
+            self._fresh_reading = True
 
             print(f"📡 Beacon detected: {name} | RSSI: {adv_data.rssi} dBm | EMA: {round(self.smoothed_rssi)} dBm")
 
@@ -98,8 +87,9 @@ class LocalBLEScanner:
         # is needed to call a direction — large enough to ignore jitter but
         # small enough to catch real movement within a few seconds.
         DEAD_BAND = 5
-        if beacon_live and self.smoothed_rssi is not None:
+        if self._fresh_reading and self.smoothed_rssi is not None:
             self._trend_history.append(self.smoothed_rssi)
+        self._fresh_reading = False
 
         if len(self._trend_history) >= 2:
             oldest = self._trend_history[0]
@@ -131,13 +121,12 @@ class LocalBLEScanner:
                 msg    = "Signal critically low!"
 
         elif elapsed <= LOST_AFTER_SEC:
-            # FADING tier: beacon hasn't been heard this cycle, but we
-            # haven't given up yet. Use the FROZEN last-known reading (do
-            # NOT recompute an average from old samples) so we don't get
-            # the old bug where stale strong values kept reporting SECURE
-            # well after the phone had actually left range.
+         
             current_rssi = self.last_known_rssi
-            if current_rssi is not None and current_rssi >= WEAK_THRESHOLD:
+            if current_rssi is not None and current_rssi >= STRONG_THRESHOLD:
+                status = "SECURE"
+                msg    = "Phone inside safe perimeter"
+            elif current_rssi is not None and current_rssi >= WEAK_THRESHOLD:
                 status = "WEAK"
                 msg    = "Signal weak — beacon drifting out of range"
             else:
@@ -146,9 +135,7 @@ class LocalBLEScanner:
                 current_rssi = None
 
         else:
-            # LOST tier: silence has gone on too long — stop pretending we
-            # know anything and report it plainly. Reset EMA so the next
-            # detection starts clean instead of being dragged by ancient data.
+          
             status        = "LOST"
             msg           = "Beacon signal lost"
             current_rssi  = None
