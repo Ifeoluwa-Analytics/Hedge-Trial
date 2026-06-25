@@ -130,12 +130,12 @@
 
     // ─── TREND → PILL LABEL ───────────────────────────────────────────────────
     // The backend now sends a `trend` field: 'approaching' | 'departing' | 'steady'
-    // computed from consecutive avg-RSSI deltas with a 2 dBm dead-band.
+    // computed from a 6-cycle windowed delta (5 dBm dead-band) in the scanner.
     // We map it directly to copy — no frontend re-computation needed.
     function trendLabel(trend) {
         if (trend === 'approaching') return 'Approaching safe zone';
         if (trend === 'departing')   return 'Departing safe zone';
-        return 'Signal stable';
+        return 'Monitor closely';   // steady while WEAK — not safe, not clearly moving
     }
 
     // ─── PILL THEMES ─────────────────────────────────────────────────────────
