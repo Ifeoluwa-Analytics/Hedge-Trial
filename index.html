@@ -30,8 +30,8 @@
                     </div>
                 </div>
 
-                <h2 id="child-name"  class="text-xl font-bold mb-1">Waiting for Beacon...</h2>
-                <h3 id="child-id"    class="text-sm text-gray-500 mb-1">CH_--</h3>
+                <h2 id="child-name"     class="text-xl font-bold mb-1">Waiting for Beacon...</h2>
+                <h3 id="child-id"       class="text-sm text-gray-500 mb-1">CH_--</h3>
                 <p  id="system-message" class="text-gray-400 text-sm mb-6">
                     Start your scanner loop to transmit signal details.
                 </p>
@@ -52,7 +52,7 @@
                 <div id="distance-pill"
                      class="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full
                             bg-emerald-500/10 border border-emerald-500/30 hidden">
-                    <span id="distance-dot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    <span id="distance-dot"  class="w-2 h-2 rounded-full bg-emerald-400"></span>
                     <span id="distance-text" class="text-sm font-medium text-emerald-300">
                         -- m from parent · Within safe zone
                     </span>
@@ -74,8 +74,7 @@
 
     <audio id="alarm-sound"
            src="https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg"
-           preload="auto"
-           loop></audio>
+           preload="auto" loop></audio>
 
     <script>
     // ─── DOM REFS ─────────────────────────────────────────────────────────────
@@ -105,7 +104,6 @@
     document.addEventListener('click',      tryUnlockAudio, { passive: true });
     document.addEventListener('touchstart', tryUnlockAudio, { passive: true });
 
-    // ─── ESCALATION HANDLER ──────────────────────────────────────────────────
     function escalate() {
         alert('🚨 Venue Security has been notified. Help is on the way.');
     }
@@ -115,30 +113,69 @@
     const PATH_LOSS_EXPONENT   = 2.5;
 
     function rssiToDistance(rssi) {
-        if (rssi === undefined || rssi === null) return null;
-        const distance = Math.pow(10, (MEASURED_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT));
-        return Math.round(distance * 10) / 10;
+        if (rssi === null || rssi === undefined) return null;
+        return Math.round(
+            Math.pow(10, (MEASURED_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT)) * 10
+        ) / 10;
     }
 
-    function formatDistance(metres) {
-        if (metres === null) return '-- m';
-        return metres < 100 ? `${metres.toFixed(1)}m` : `${Math.round(metres)}m`;
+    function formatDistance(m) {
+        if (m === null) return '--';
+        return m < 100 ? `${m.toFixed(1)}m` : `${Math.round(m)}m`;
     }
 
+    // Frozen snapshot used during BREACH / LOST when no fresh distance exists
     let lastKnownDistance = null;
     let lastKnownTime     = null;
 
-    // ─── DIRECTION TRACKING ───────────────────────────────────────────────────
+    // ─── TREND → PILL LABEL ───────────────────────────────────────────────────
+    // The backend now sends a `trend` field: 'approaching' | 'departing' | 'steady'
+    // computed from consecutive avg-RSSI deltas with a 2 dBm dead-band.
+    // We map it directly to copy — no frontend re-computation needed.
+    function trendLabel(trend) {
+        if (trend === 'approaching') return 'Approaching safe zone';
+        if (trend === 'departing')   return 'Departing safe zone';
+        return 'Signal stable';
+    }
 
-    let previousStatus = 'INIT';  // last status received (excluding HEARTBEAT)
+    // ─── PILL THEMES ─────────────────────────────────────────────────────────
+    const PILL_THEMES = {
+        emerald: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30',
+            dot:  'w-2 h-2 rounded-full bg-emerald-400',
+            text: 'text-sm font-medium text-emerald-300',
+        },
+        yellow: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-yellow-500/10 border border-yellow-500/40',
+            dot:  'w-2 h-2 rounded-full bg-yellow-400',
+            text: 'text-sm font-medium text-yellow-200',
+        },
+        red: {
+            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 border border-red-500/40',
+            dot:  'w-2 h-2 rounded-full bg-red-400',
+            text: 'text-sm font-medium text-red-200',
+        },
+    };
+
+    function showDistancePill(theme, text) {
+        const t = PILL_THEMES[theme] || PILL_THEMES.emerald;
+        distancePill.className   = t.wrap;
+        distanceDot.className    = t.dot;
+        distanceText.className   = t.text;
+        distanceText.textContent = text;
+        distancePill.classList.remove('hidden');
+    }
+
+    function hideDistancePill() { distancePill.classList.add('hidden'); }
 
     // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
-    function applyTheme(status, rssi) {
+    function applyTheme(status, rssi, trend) {
         emergencyAction.classList.add('hidden');
         alarmSound.pause();
 
         switch (status) {
 
+            // ── SECURE ───────────────────────────────────────────────────────
             case 'SECURE': {
                 bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
@@ -148,15 +185,16 @@
                 statusDot.textContent = '📡';
 
                 const d = rssiToDistance(rssi);
-                lastKnownDistance = d;
-                lastKnownTime     = new Date();
-                showDistancePill(
-                    'emerald',
-                    `${formatDistance(d)} from parent · Within safe zone`
-                );
+                if (d !== null) { lastKnownDistance = d; lastKnownTime = new Date(); }
+                // In SECURE we always show "Within safe zone" regardless of trend —
+                // the child is safely in range; direction is secondary info.
+                showDistancePill('emerald', `${formatDistance(d)} from parent · Within safe zone`);
                 break;
             }
 
+            // ── WEAK ─────────────────────────────────────────────────────────
+            // Direction of travel IS the key info here; use the trend label.
+            case 'NOT_FOUND':   // legacy alias — backend no longer sends this
             case 'WEAK': {
                 bodyBg.className      = 'bg-yellow-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-yellow-900/80 rounded-3xl p-8 text-center shadow-2xl border border-yellow-500 transition-all duration-500';
@@ -166,66 +204,27 @@
                 statusDot.textContent = '⚠️';
                 emergencyAction.classList.remove('hidden');
 
-                // ── Direction-aware pill copy ─────────────────────────────
-                // "Approaching" if we're recovering from BREACH (or LOST).
-                // "Departing"   if we were previously SECURE (or this is the
-                //                first WEAK we've seen, meaning we drifted
-                //                from a secure-ish start).
-                // "Weak signal" if the previous status was already WEAK
-                //                (steady-state; avoid noisy label flip-flop).
-                const wasBreaching = (previousStatus === 'BREACH' || previousStatus === 'LOST');
-                const wasSecure    = (previousStatus === 'SECURE');
-                const wasWeak      = (previousStatus === 'WEAK');
+                const label = trendLabel(trend);
 
-                let zoneLabel;
-                if (wasBreaching) {
-                    zoneLabel = 'Approaching safe zone';
-                } else if (wasSecure) {
-                    zoneLabel = 'Departing safe zone';
-                } else {
-                    // INIT, WEAK→WEAK (sustained weak), or any other state
-                    // — keep showing last direction or a neutral label
-                    zoneLabel = wasWeak ? distanceText.textContent.split('·')[1]?.trim() || 'Weak signal' : 'Weak signal';
-                }
-
-                // If RSSI is a real live value (not the -120 sentinel), compute
-                // a fresh distance; otherwise freeze on last known.
-                if (rssi > -120) {
+                if (rssi !== null && rssi !== undefined) {
                     const d = rssiToDistance(rssi);
-                    lastKnownDistance = d;
-                    lastKnownTime     = new Date();
-                    showDistancePill('yellow', `${formatDistance(d)} from parent · ${zoneLabel}`);
+                    if (d !== null) { lastKnownDistance = d; lastKnownTime = new Date(); }
+                    showDistancePill('yellow', `${formatDistance(d)} from parent · ${label}`);
                 } else {
+                    // Buffer recently drained but status is still WEAK from tail values
                     showDistancePill(
                         'yellow',
                         lastKnownDistance !== null
-                            ? `Last seen ${formatDistance(lastKnownDistance)} · ${zoneLabel}`
-                            : `Searching… · ${zoneLabel}`
+                            ? `Last seen ${formatDistance(lastKnownDistance)} · ${label}`
+                            : `Searching… · ${label}`
                     );
                 }
                 break;
             }
 
-            // Legacy alias — backend no longer sends this but guard it anyway
-            case 'NOT_FOUND': {
-                bodyBg.className      = 'bg-yellow-950 text-white font-sans antialiased transition-colors duration-500';
-                statusCard.className  = 'w-full bg-yellow-900/80 rounded-3xl p-8 text-center shadow-2xl border border-yellow-500 transition-all duration-500';
-                statusDot.className   = 'w-12 h-12 rounded-full bg-yellow-500 flex items-center justify-center text-2xl animate-bounce';
-                statusPulse.className = 'w-24 h-24 rounded-full bg-yellow-600/40 flex items-center justify-center';
-                statusVal.className   = 'text-lg font-bold text-yellow-200';
-                statusDot.textContent = '⚠️';
-                emergencyAction.classList.remove('hidden');
-                showDistancePill(
-                    'yellow',
-                    lastKnownDistance !== null
-                        ? `Last seen ${formatDistance(lastKnownDistance)} · Departing safe zone`
-                        : 'Searching for beacon…'
-                );
-                break;
-            }
-
-            case 'BREACH':
-            case 'LOST': {
+            // ── BREACH ───────────────────────────────────────────────────────
+            // Beacon gone but buffer was recently populated — freeze last known.
+            case 'BREACH': {
                 bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
                 statusDot.className   = 'w-12 h-12 rounded-full bg-red-500 flex items-center justify-center text-2xl';
@@ -247,6 +246,24 @@
                 break;
             }
 
+            // ── LOST ─────────────────────────────────────────────────────────
+            // rssi is null, buffer empty, beacon gone for many cycles.
+            // Show dashes for both signal and distance — no estimates.
+            case 'LOST': {
+                bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
+                statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
+                statusDot.className   = 'w-12 h-12 rounded-full bg-red-800 flex items-center justify-center text-2xl';
+                statusPulse.className = 'w-24 h-24 rounded-full bg-red-900/40 flex items-center justify-center';
+                statusVal.className   = 'text-lg font-bold text-red-300';
+                statusDot.textContent = '❌';
+                emergencyAction.classList.remove('hidden');
+                if (audioUnlocked) alarmSound.play().catch(() => {});
+
+                showDistancePill('red', '-- · Signal completely lost');
+                break;
+            }
+
+            // ── INIT / fallback ───────────────────────────────────────────────
             case 'INIT':
             default: {
                 bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
@@ -261,50 +278,15 @@
         }
     }
 
-    // ── Distance pill helpers ─────────────────────────────────────────────────
-    const PILL_THEMES = {
-        emerald: {
-            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30',
-            dot:  'w-2 h-2 rounded-full bg-emerald-400',
-            text: 'text-sm font-medium text-emerald-300',
-        },
-        yellow: {
-            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-yellow-500/10 border border-yellow-500/40',
-            dot:  'w-2 h-2 rounded-full bg-yellow-400',
-            text: 'text-sm font-medium text-yellow-200',
-        },
-        red: {
-            wrap: 'mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/10 border border-red-500/40',
-            dot:  'w-2 h-2 rounded-full bg-red-400',
-            text: 'text-sm font-medium text-red-200',
-        },
-    };
-
-    function showDistancePill(theme, text) {
-        const t = PILL_THEMES[theme] || PILL_THEMES.emerald;
-        distancePill.className = t.wrap;
-        distanceDot.className  = t.dot;
-        distanceText.className = t.text;
-        distanceText.textContent = text;
-        distancePill.classList.remove('hidden');
-    }
-
-    function hideDistancePill() {
-        distancePill.classList.add('hidden');
-    }
-
     // ─── WEBSOCKET ────────────────────────────────────────────────────────────
     let socket;
     let reconnectDelay = 4000;
-    let reconnectTimer = null;
 
     function connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl    = `${protocol}//${window.location.host}/ws/monitor`;
         console.log(`🔌 [HEDGE] Connecting → ${wsUrl}`);
-
         systemMessage.textContent = 'Connecting to cloud engine…';
-
         socket = new WebSocket(wsUrl);
 
         socket.onopen = () => {
@@ -319,39 +301,32 @@
             catch { return; }
 
             console.log('📥 [HEDGE] Packet:', data);
-
-            // Skip heartbeats — they must never update previousStatus
             if (data.status === 'HEARTBEAT') return;
 
-            // Update text content
+            // rssi is null  → backend has no data (LOST state)
+            // rssi is a number → real or stale reading
+            const hasRssi = data.rssi !== null && data.rssi !== undefined;
+
+            // Update text fields
             childName.textContent     = data.child_name || 'Unknown';
             childId.textContent       = data.child_id   || 'CH_--';
-            rssiVal.textContent       = (data.rssi !== undefined ? data.rssi : '--') + ' dBm';
-            systemMessage.textContent = data.message    || '';
-            statusVal.textContent     = data.status     || 'UNKNOWN';
+            rssiVal.textContent       = hasRssi ? `${data.rssi} dBm` : '-- dBm';
+            systemMessage.textContent = data.message || '';
+            statusVal.textContent     = data.status  || 'UNKNOWN';
 
-            // Apply theme BEFORE updating previousStatus so applyTheme can
-            // still read what the previous state was.
-            applyTheme(data.status, data.rssi);
-
-            // Now advance the history — only for meaningful statuses
-            if (data.status && data.status !== 'HEARTBEAT') {
-                previousStatus = data.status;
-            }
+            applyTheme(data.status, hasRssi ? data.rssi : null, data.trend || 'steady');
         };
 
         socket.onclose = (e) => {
-            console.warn(`❌ [HEDGE] Connection closed (code ${e.code}) — retrying in ${reconnectDelay / 1000}s`);
+            console.warn(`❌ [HEDGE] Closed (${e.code}) — retrying in ${reconnectDelay / 1000}s`);
             systemMessage.textContent = `Reconnecting… (${reconnectDelay / 1000}s)`;
-            reconnectTimer = setTimeout(() => {
+            setTimeout(() => {
                 reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
                 connect();
             }, reconnectDelay);
         };
 
-        socket.onerror = (e) => {
-            console.error('⚠️  [HEDGE] WebSocket error', e);
-        };
+        socket.onerror = (e) => console.error('⚠️ [HEDGE] WS error', e);
     }
 
     connect();
