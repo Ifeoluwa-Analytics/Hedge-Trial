@@ -2,6 +2,7 @@ import os
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -46,11 +47,11 @@ class BeaconTelemetry(Base):
     timestamp      = Column(DateTime, default=datetime.utcnow)
     beacon_mac     = Column(String, nullable=False)
     child_id       = Column(String, ForeignKey("children.child_id"), nullable=False)
-    child_name     = Column(String, nullable=False)          # ← stored for backfill
+    child_name     = Column(String, nullable=False)
     rssi_threshold = Column(Integer, nullable=False)
-    current_rssi   = Column(Integer, nullable=False)
+    current_rssi   = Column(Integer, nullable=False)   # -999 stored when status=LOST
     current_status = Column(String, nullable=False)
-    message        = Column(Text, nullable=True)             # ← human-readable msg
+    message        = Column(Text, nullable=True)
 
 
 # ─── SEED / MOCK DATA ─────────────────────────────────────────────────────────
@@ -98,16 +99,11 @@ def initialize_and_seed_database():
 def log_telemetry_to_db(
     child_id: str,
     child_name: str,
-    rssi: int,
+    rssi: Optional[int],   # None when LOST — stored as -999 (column is NOT NULL)
     status: str,
     message: str,
     threshold: int,
 ):
-    """
-    Persists one telemetry row to THIS instance's SQLite file.
-    Local and Render each write to their own separate hedge_tracker.db —
-    there is no shared database, by design.
-    """
     db = SessionLocal()
     try:
         entry = BeaconTelemetry(
@@ -116,13 +112,14 @@ def log_telemetry_to_db(
             child_id       = child_id,
             child_name     = child_name,
             rssi_threshold = threshold,
-            current_rssi   = rssi,
+            current_rssi   = rssi if rssi is not None else -999,
             current_status = status,
             message        = message,
         )
         db.add(entry)
         db.commit()
-        print(f"💾 [{INSTANCE_NAME}] DB write OK — {child_name} | {rssi} dBm | {status}")
+        rssi_display = f"{rssi} dBm" if rssi is not None else "-- (LOST)"
+        print(f"💾 [{INSTANCE_NAME}] DB write OK — {child_name} | {rssi_display} | {status}")
     except Exception as exc:
         db.rollback()
         print(f"❌ [{INSTANCE_NAME}] DB write error: {exc}")
@@ -160,8 +157,6 @@ class ConnectionManager:
             print(f"🔌 [{INSTANCE_NAME}] WS client removed — total: {len(self.active_connections)}")
 
     async def broadcast(self, payload: dict):
-        """Fan-out to all clients connected to THIS instance only; prune stale
-        connections on send failure."""
         dead: list[WebSocket] = []
         for ws in self.active_connections:
             try:
@@ -179,9 +174,10 @@ manager = ConnectionManager()
 class BeaconPayload(BaseModel):
     child_id:   str
     child_name: str
-    rssi:       int
+    rssi:       Optional[int] = None   # None when status is LOST (buffer empty)
     status:     str
     message:    str
+    trend:      str = "steady"         # 'approaching' | 'departing' | 'steady'
 
 
 # ─── APP LIFESPAN ─────────────────────────────────────────────────────────────
@@ -194,11 +190,11 @@ async def lifespan(app: FastAPI):
 
 
 # ─── FASTAPI APP ──────────────────────────────────────────────────────────────
-app = FastAPI(title=f"Hedge Cloud API [{INSTANCE_NAME}]", version="1.2", lifespan=lifespan)
+app = FastAPI(title=f"Hedge Cloud API [{INSTANCE_NAME}]", version="1.3", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # lock to your Render domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -208,8 +204,6 @@ app.add_middleware(
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def serve_frontend():
-    # FIX: resolve index.html relative to this script too, so "python
-    # cloud_api_server.py" works regardless of your current terminal folder.
     return FileResponse(os.path.join(BASE_DIR, "index.html"))
 
 
@@ -224,14 +218,7 @@ def health_check():
 
 @app.post("/api/telemetry")
 async def receive_telemetry(payload: BeaconPayload):
-    """
-    Accepts processed RSSI data from local_ble_scanner.py.
-    The scanner posts to MULTIPLE instances of this same service (e.g. one
-    local, one on Render) — each instance independently persists to its own
-    SQLite file and broadcasts only to the WebSocket clients connected to it.
-    There is no cross-instance awareness or sync by design.
-    """
-    # 1. Persist to THIS instance's database
+    # 1. Persist — rssi=None (LOST) is stored as -999 to satisfy NOT NULL column
     log_telemetry_to_db(
         child_id   = payload.child_id,
         child_name = payload.child_name,
@@ -241,48 +228,49 @@ async def receive_telemetry(payload: BeaconPayload):
         threshold  = STRONG_THRESHOLD,
     )
 
-    # 2. Broadcast downstream to whoever is connected to THIS instance's frontend
+    # 2. Broadcast — rssi=None becomes JSON null; trend passes straight through
     await manager.broadcast({
         "child_id":   payload.child_id,
         "child_name": payload.child_name,
-        "rssi":       payload.rssi,
+        "rssi":       payload.rssi,    # null in JSON when LOST → frontend shows '--'
         "status":     payload.status,
         "message":    payload.message,
+        "trend":      payload.trend,
     })
 
-    print(f"📊 [{INSTANCE_NAME}] Telemetry → {payload.child_name} | {payload.rssi} dBm | {payload.status}")
+    rssi_display = f"{payload.rssi} dBm" if payload.rssi is not None else "-- (LOST)"
+    print(f"📊 [{INSTANCE_NAME}] Telemetry → {payload.child_name} | {rssi_display} | {payload.status} | {payload.trend}")
     return {"status": "Processed", "instance": INSTANCE_NAME, "child_status": payload.status}
 
 
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Real-time dashboard endpoint, scoped to THIS instance only.
-    On connect: replays the last known DB record so the UI is never blank.
-    While open: echoes keep-alive heartbeats every 25 s to survive Render's
-                proxy idle timeout (~30 s).
-    """
     await manager.connect(websocket)
 
     # ── Historical backfill ──────────────────────────────────────────────────
     try:
         last = fetch_last_telemetry(CHILD_ID)
         if last:
+            # -999 in DB means the row was written during a LOST cycle — send
+            # null back to the frontend so it renders '--' correctly.
+            rssi_out = last.current_rssi if last.current_rssi != -999 else None
             await websocket.send_json({
                 "child_id":   last.child_id,
-                "child_name": last.child_name,   # ← from DB row, not hardcoded
-                "rssi":       last.current_rssi,
+                "child_name": last.child_name,
+                "rssi":       rssi_out,
                 "status":     last.current_status,
                 "message":    f"{last.message or 'Last known state'} "
                               f"(restored {last.timestamp.strftime('%H:%M:%S')})",
+                "trend":      "steady",   # no trend on backfill — direction unknown
             })
         else:
             await websocket.send_json({
                 "child_id":   CHILD_ID,
                 "child_name": CHILD_NAME,
-                "rssi":       0,
+                "rssi":       None,
                 "status":     "INIT",
                 "message":    "System online — waiting for scanner telemetry...",
+                "trend":      "steady",
             })
     except Exception as exc:
         print(f"⚠️  [{INSTANCE_NAME}] Backfill error: {exc}")
@@ -291,10 +279,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             try:
-                # Short timeout keeps the worker responsive without burning CPU
                 await asyncio.wait_for(websocket.receive_text(), timeout=25.0)
             except asyncio.TimeoutError:
-                # Heartbeat prevents Render's proxy from closing an idle socket
                 await websocket.send_json({
                     "status":  "HEARTBEAT",
                     "message": "keep-alive",
@@ -309,6 +295,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))   # Render injects PORT at runtime
+    port = int(os.environ.get("PORT", 8000))
     print(f"🚀 Starting Hedge Cloud API as instance: '{INSTANCE_NAME}' on port {port}")
     uvicorn.run("cloud_api_server:app", host="0.0.0.0", port=port, reload=False)
