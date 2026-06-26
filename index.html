@@ -23,10 +23,10 @@
                 <div class="flex justify-center mb-6">
 
                     <div id="status-pulse"
-                         class="w-24 h-24 rounded-full bg-gray-600/20 flex items-center justify-center animate-pulse">
+                         class="w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse">
                         <div id="status-dot"
-                             class="w-12 h-12 rounded-full bg-gray-500 flex items-center justify-center text-2xl">
-                            🔍
+                             class="w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl">
+                            📡
                         </div>
                     </div>
                 </div>
@@ -46,16 +46,17 @@
                     </div>
                     <div class="bg-gray-900 p-3 rounded-xl border border-gray-700/50">
                         <p class="text-xs text-gray-400 uppercase tracking-wider">Status</p>
-                        <p id="status-val" class="text-lg font-bold text-gray-300">STANDBY</p>
+                        <p id="status-val" class="text-lg font-bold text-emerald-400">STANDBY</p>
                     </div>
                 </div>
 
                 <div id="distance-pill"
                      class="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full
-                            bg-gray-500/10 border border-gray-500/30"
-                     style="display:none;">
-                    <span id="distance-dot"  class="w-2 h-2 rounded-full bg-gray-400"></span>
-                    <span id="distance-text" class="text-sm font-medium text-gray-300"></span>
+                            bg-emerald-500/10 border border-emerald-500/30">
+                    <span id="distance-dot"  class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    <span id="distance-text" class="text-sm font-medium text-emerald-300">
+                        -- m from parent · Within safe zone
+                    </span>
                 </div>
             </div>
         </main>
@@ -165,20 +166,19 @@
 
     function hideDistancePill() { distancePill.style.display = 'none'; }
 
-
     function applyStandbyTheme(message) {
         bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
         statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
-        statusDot.className   = 'w-12 h-12 rounded-full bg-gray-500 flex items-center justify-center text-2xl';
-        statusPulse.className = 'w-24 h-24 rounded-full bg-gray-600/20 flex items-center justify-center animate-pulse';
-        statusVal.className   = 'text-lg font-bold text-gray-300';
-        statusDot.textContent = '🔍';
+        statusDot.className   = 'w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl';
+        statusPulse.className = 'w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse';
+        statusVal.className   = 'text-lg font-bold text-emerald-400';
+        statusDot.textContent = '📡';
         statusVal.textContent = 'STANDBY';
         rssiVal.textContent   = '-- dBm';
         systemMessage.textContent = message;
         emergencyAction.style.display = 'none';
         alarmSound.pause();
-        hideDistancePill();
+        showDistancePill('emerald', '-- m from parent · Within safe zone');
     }
 
     // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
@@ -285,7 +285,7 @@
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl    = `${protocol}//${window.location.host}/ws/monitor`;
         console.log(`🔌 [HEDGE] Connecting → ${wsUrl}`);
-        applyStandbyTheme('Connecting to cloud engine...');
+        applyStandbyTheme('Connecting to cloud engine…');
         socket = new WebSocket(wsUrl);
 
         socket.onopen = () => {
@@ -303,7 +303,6 @@
             if (data.status === 'HEARTBEAT') return;
 
             if (data.status === 'STANDBY') {
-
                 systemMessage.textContent = data.message || 'Connecting to cloud engine...';
                 applyTheme('STANDBY', null, 'steady');
                 return;
@@ -311,18 +310,17 @@
 
             const hasRssi = data.rssi !== null && data.rssi !== undefined;
 
-            childName.textContent     = data.child_name || 'Unknown';
+            childName.textContent     = data.child_name || 'Waiting for Beacon...';
             childId.textContent       = data.child_id   || 'CH_--';
             rssiVal.textContent       = hasRssi ? `${data.rssi} dBm` : '-- dBm';
             systemMessage.textContent = data.message || '';
-            statusVal.textContent     = data.status  || 'UNKNOWN';
+            statusVal.textContent     = data.status  || 'Waiting for Beacon...';
 
             applyTheme(data.status, hasRssi ? data.rssi : null, data.trend || 'steady');
         };
 
         socket.onclose = (e) => {
             console.warn(`❌ [HEDGE] Closed (${e.code}) — retrying in ${reconnectDelay / 1000}s`);
-       
             applyStandbyTheme(`Reconnecting… (${reconnectDelay / 1000}s)`);
             setTimeout(() => {
                 reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
