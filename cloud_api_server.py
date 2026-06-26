@@ -190,7 +190,7 @@ async def lifespan(app: FastAPI):
 
 
 # ─── FASTAPI APP ──────────────────────────────────────────────────────────────
-app = FastAPI(title=f"Hedge Cloud API [{INSTANCE_NAME}]", version="1.3", lifespan=lifespan)
+app = FastAPI(title=f"Hedge Cloud API [{INSTANCE_NAME}]", version="1.4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,7 +218,7 @@ def health_check():
 
 @app.post("/api/telemetry")
 async def receive_telemetry(payload: BeaconPayload):
-    # 1. Persist — rssi=None (LOST) is stored as -999 to satisfy NOT NULL column
+
     log_telemetry_to_db(
         child_id   = payload.child_id,
         child_name = payload.child_name,
@@ -228,7 +228,6 @@ async def receive_telemetry(payload: BeaconPayload):
         threshold  = STRONG_THRESHOLD,
     )
 
-    # 2. Broadcast — rssi=None becomes JSON null; trend passes straight through
     await manager.broadcast({
         "child_id":   payload.child_id,
         "child_name": payload.child_name,
@@ -251,8 +250,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         last = fetch_last_telemetry(CHILD_ID)
         if last:
-            # -999 in DB means the row was written during a LOST cycle — send
-            # null back to the frontend so it renders '--' correctly.
+
             rssi_out = last.current_rssi if last.current_rssi != -999 else None
             await websocket.send_json({
                 "child_id":   last.child_id,
@@ -264,12 +262,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 "trend":      "steady",   # no trend on backfill — direction unknown
             })
         else:
+
             await websocket.send_json({
-                "child_id":   CHILD_ID,
-                "child_name": CHILD_NAME,
+                "child_id":   None,
+                "child_name": None,
                 "rssi":       None,
-                "status":     "INIT",
-                "message":    "System online — waiting for scanner telemetry...",
+                "status":     "STANDBY",
+                "message":    "Connecting to cloud engine...",
                 "trend":      "steady",
             })
     except Exception as exc:
