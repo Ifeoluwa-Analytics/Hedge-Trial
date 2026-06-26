@@ -21,11 +21,12 @@
                  class="w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500">
 
                 <div class="flex justify-center mb-6">
+
                     <div id="status-pulse"
-                         class="w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center animate-pulse">
+                         class="w-24 h-24 rounded-full bg-gray-600/20 flex items-center justify-center animate-pulse">
                         <div id="status-dot"
-                             class="w-12 h-12 rounded-full bg-emerald-500 flex items-center justify-center text-2xl">
-                            📡
+                             class="w-12 h-12 rounded-full bg-gray-500 flex items-center justify-center text-2xl">
+                            🔍
                         </div>
                     </div>
                 </div>
@@ -45,22 +46,21 @@
                     </div>
                     <div class="bg-gray-900 p-3 rounded-xl border border-gray-700/50">
                         <p class="text-xs text-gray-400 uppercase tracking-wider">Status</p>
-                        <p id="status-val" class="text-lg font-bold text-emerald-400">STANDBY</p>
+                        <p id="status-val" class="text-lg font-bold text-gray-300">STANDBY</p>
                     </div>
                 </div>
 
                 <div id="distance-pill"
                      class="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full
-                            bg-emerald-500/10 border border-emerald-500/30 hidden">
-                    <span id="distance-dot"  class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                    <span id="distance-text" class="text-sm font-medium text-emerald-300">
-                        -- m from parent · Within safe zone
-                    </span>
+                            bg-gray-500/10 border border-gray-500/30"
+                     style="display:none;">
+                    <span id="distance-dot"  class="w-2 h-2 rounded-full bg-gray-400"></span>
+                    <span id="distance-text" class="text-sm font-medium text-gray-300"></span>
                 </div>
             </div>
         </main>
 
-        <footer id="emergency-action" class="w-full hidden pb-4">
+        <footer id="emergency-action" class="w-full pb-4" style="display:none;">
             <button
                 onclick="escalate()"
                 class="w-full bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold
@@ -129,9 +129,6 @@
     let lastKnownTime     = null;
 
     // ─── TREND → PILL LABEL ───────────────────────────────────────────────────
-    // The backend now sends a `trend` field: 'approaching' | 'departing' | 'steady'
-    // computed from a 6-cycle windowed delta (5 dBm dead-band) in the scanner.
-    // We map it directly to copy — no frontend re-computation needed.
     function trendLabel(trend) {
         if (trend === 'approaching') return 'Approaching safe zone';
         if (trend === 'departing')   return 'Departing safe zone';
@@ -163,14 +160,30 @@
         distanceDot.className    = t.dot;
         distanceText.className   = t.text;
         distanceText.textContent = text;
-        distancePill.classList.remove('hidden');
+        distancePill.style.display = '';
     }
 
-    function hideDistancePill() { distancePill.classList.add('hidden'); }
+    function hideDistancePill() { distancePill.style.display = 'none'; }
+
+
+    function applyStandbyTheme(message) {
+        bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
+        statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
+        statusDot.className   = 'w-12 h-12 rounded-full bg-gray-500 flex items-center justify-center text-2xl';
+        statusPulse.className = 'w-24 h-24 rounded-full bg-gray-600/20 flex items-center justify-center animate-pulse';
+        statusVal.className   = 'text-lg font-bold text-gray-300';
+        statusDot.textContent = '🔍';
+        statusVal.textContent = 'STANDBY';
+        rssiVal.textContent   = '-- dBm';
+        systemMessage.textContent = message;
+        emergencyAction.style.display = 'none';
+        alarmSound.pause();
+        hideDistancePill();
+    }
 
     // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
     function applyTheme(status, rssi, trend) {
-        emergencyAction.classList.add('hidden');
+        emergencyAction.style.display = 'none';
         alarmSound.pause();
 
         switch (status) {
@@ -186,15 +199,11 @@
 
                 const d = rssiToDistance(rssi);
                 if (d !== null) { lastKnownDistance = d; lastKnownTime = new Date(); }
-                // In SECURE we always show "Within safe zone" regardless of trend —
-                // the child is safely in range; direction is secondary info.
                 showDistancePill('emerald', `${formatDistance(d)} from parent · Within safe zone`);
                 break;
             }
 
             // ── WEAK ─────────────────────────────────────────────────────────
-            // Direction of travel IS the key info here; use the trend label.
-            case 'NOT_FOUND':   // legacy alias — backend no longer sends this
             case 'WEAK': {
                 bodyBg.className      = 'bg-yellow-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-yellow-900/80 rounded-3xl p-8 text-center shadow-2xl border border-yellow-500 transition-all duration-500';
@@ -202,7 +211,7 @@
                 statusPulse.className = 'w-24 h-24 rounded-full bg-yellow-600/40 flex items-center justify-center';
                 statusVal.className   = 'text-lg font-bold text-yellow-200';
                 statusDot.textContent = '⚠️';
-                emergencyAction.classList.remove('hidden');
+                emergencyAction.style.display = '';
 
                 const label = trendLabel(trend);
 
@@ -211,7 +220,6 @@
                     if (d !== null) { lastKnownDistance = d; lastKnownTime = new Date(); }
                     showDistancePill('yellow', `${formatDistance(d)} from parent · ${label}`);
                 } else {
-                    // Buffer recently drained but status is still WEAK from tail values
                     showDistancePill(
                         'yellow',
                         lastKnownDistance !== null
@@ -223,7 +231,6 @@
             }
 
             // ── BREACH ───────────────────────────────────────────────────────
-            // Beacon gone but buffer was recently populated — freeze last known.
             case 'BREACH': {
                 bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
@@ -231,7 +238,7 @@
                 statusPulse.className = 'w-24 h-24 rounded-full bg-red-600/40 flex items-center justify-center animate-ping';
                 statusVal.className   = 'text-lg font-bold text-red-200';
                 statusDot.textContent = '🚨';
-                emergencyAction.classList.remove('hidden');
+                emergencyAction.style.display = '';
                 if (audioUnlocked) alarmSound.play().catch(() => {});
 
                 const timeLabel = lastKnownTime
@@ -247,8 +254,6 @@
             }
 
             // ── LOST ─────────────────────────────────────────────────────────
-            // rssi is null, buffer empty, beacon gone for many cycles.
-            // Show dashes for both signal and distance — no estimates.
             case 'LOST': {
                 bodyBg.className      = 'bg-red-950 text-white font-sans antialiased transition-colors duration-500';
                 statusCard.className  = 'w-full bg-red-900 rounded-3xl p-8 text-center shadow-2xl border border-red-500 transition-all duration-500';
@@ -256,23 +261,17 @@
                 statusPulse.className = 'w-24 h-24 rounded-full bg-red-900/40 flex items-center justify-center';
                 statusVal.className   = 'text-lg font-bold text-red-300';
                 statusDot.textContent = '❌';
-                emergencyAction.classList.remove('hidden');
+                emergencyAction.style.display = '';
                 if (audioUnlocked) alarmSound.play().catch(() => {});
 
-                showDistancePill('red', '-- · Signal completely lost');
+                showDistancePill('red', '-- · Signal lost');
                 break;
             }
 
-            // ── INIT / fallback ───────────────────────────────────────────────
-            case 'INIT':
+            // ── STANDBY / fallback ───────────────────────────────────────────────
+            case 'STANDBY':
             default: {
-                bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
-                statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
-                statusDot.className   = 'w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center text-2xl animate-pulse';
-                statusPulse.className = 'w-24 h-24 rounded-full bg-blue-500/20 flex items-center justify-center';
-                statusVal.className   = 'text-lg font-bold text-blue-400';
-                statusDot.textContent = '🔍';
-                hideDistancePill();
+                applyStandbyTheme(systemMessage.textContent || 'Connecting to cloud engine...');
                 break;
             }
         }
@@ -286,7 +285,7 @@
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl    = `${protocol}//${window.location.host}/ws/monitor`;
         console.log(`🔌 [HEDGE] Connecting → ${wsUrl}`);
-        systemMessage.textContent = 'Connecting to cloud engine…';
+        applyStandbyTheme('Connecting to cloud engine...');
         socket = new WebSocket(wsUrl);
 
         socket.onopen = () => {
@@ -303,11 +302,15 @@
             console.log('📥 [HEDGE] Packet:', data);
             if (data.status === 'HEARTBEAT') return;
 
-            // rssi is null  → backend has no data (LOST state)
-            // rssi is a number → real or stale reading
+            if (data.status === 'STANDBY') {
+
+                systemMessage.textContent = data.message || 'Connecting to cloud engine...';
+                applyTheme('STANDBY', null, 'steady');
+                return;
+            }
+
             const hasRssi = data.rssi !== null && data.rssi !== undefined;
 
-            // Update text fields
             childName.textContent     = data.child_name || 'Unknown';
             childId.textContent       = data.child_id   || 'CH_--';
             rssiVal.textContent       = hasRssi ? `${data.rssi} dBm` : '-- dBm';
@@ -319,7 +322,8 @@
 
         socket.onclose = (e) => {
             console.warn(`❌ [HEDGE] Closed (${e.code}) — retrying in ${reconnectDelay / 1000}s`);
-            systemMessage.textContent = `Reconnecting… (${reconnectDelay / 1000}s)`;
+       
+            applyStandbyTheme(`Reconnecting… (${reconnectDelay / 1000}s)`);
             setTimeout(() => {
                 reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
                 connect();
