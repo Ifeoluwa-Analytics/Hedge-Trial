@@ -246,11 +246,19 @@ async def receive_telemetry(payload: BeaconPayload):
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
 
+
+    BACKFILL_FRESHNESS_SECONDS = 10
+
     # ── Historical backfill ──────────────────────────────────────────────────
     try:
         last = fetch_last_telemetry(CHILD_ID)
-        if last:
+        age_seconds = (
+            (datetime.utcnow() - last.timestamp).total_seconds() if last else None
+        )
+        is_fresh = last is not None and age_seconds <= BACKFILL_FRESHNESS_SECONDS
 
+        if is_fresh:
+    
             rssi_out = last.current_rssi if last.current_rssi != -999 else None
             await websocket.send_json({
                 "child_id":   last.child_id,
@@ -262,7 +270,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 "trend":      "steady",   # no trend on backfill — direction unknown
             })
         else:
-
+     
+            if last is not None:
+                print(
+                    f"⏳ [{INSTANCE_NAME}] Last telemetry is {age_seconds:.0f}s old "
+                    f"(> {BACKFILL_FRESHNESS_SECONDS}s) — treating as stale, not backfilling."
+                )
             await websocket.send_json({
                 "child_id":   None,
                 "child_name": None,
@@ -273,6 +286,7 @@ async def websocket_endpoint(websocket: WebSocket):
             })
     except Exception as exc:
         print(f"⚠️  [{INSTANCE_NAME}] Backfill error: {exc}")
+
 
     # ── Keep-alive loop ──────────────────────────────────────────────────────
     try:
