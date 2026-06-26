@@ -50,9 +50,11 @@
                     </div>
                 </div>
 
+            
                 <div id="distance-pill"
                      class="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full
-                            bg-emerald-500/10 border border-emerald-500/30">
+                            bg-emerald-500/10 border border-emerald-500/30"
+                     style="display:none;">
                     <span id="distance-dot"  class="w-2 h-2 rounded-full bg-emerald-400"></span>
                     <span id="distance-text" class="text-sm font-medium text-emerald-300">
                         -- m from parent · Within safe zone
@@ -166,6 +168,7 @@
 
     function hideDistancePill() { distancePill.style.display = 'none'; }
 
+    // ─── STANDBY / DISCONNECTED THEME ────────────────────────────────────────
     function applyStandbyTheme(message) {
         bodyBg.className      = 'bg-gray-900 text-white font-sans antialiased transition-colors duration-500';
         statusCard.className  = 'w-full bg-gray-800 rounded-3xl p-8 text-center shadow-xl border border-gray-700 transition-all duration-500';
@@ -178,6 +181,7 @@
         systemMessage.textContent = message;
         emergencyAction.style.display = 'none';
         alarmSound.pause();
+        hideDistancePill();
     }
 
     // ─── VISUAL STATE MACHINE ────────────────────────────────────────────────
